@@ -377,6 +377,246 @@ local function example_tool_calls_rules()
   end)
 end
 
+---Example 10: Chat with single context (file + selection)
+local function example_context_single()
+  local headless = require('opencode.headless')
+
+  headless.new():and_then(function(client)
+    print('Starting chat with context...')
+
+    return client:chat('Explain this code and suggest improvements', {
+      context = {
+        -- Current file being edited
+        current_file = vim.fn.expand('%:p'),
+        -- Additional files to include
+        mentioned_files = {
+          vim.fn.getcwd() .. '/README.md',
+        },
+        -- Code selection to analyze
+        selections = {
+          {
+            content = [[
+local function calculate(x, y)
+  return x + y
+end
+]],
+            lines = '10, 13',
+          },
+        },
+        -- Diagnostics from LSP
+        diagnostics = {
+          { message = 'Unused parameter y', severity = 2, lnum = 10, col = 28 },
+        },
+      },
+    })
+  end):and_then(function(response)
+    print('\n=== Response ===')
+    print(response.text)
+  end):catch(function(err)
+    print('Error:', vim.inspect(err))
+  end)
+end
+
+---Example 11: Chat with multiple contexts (batch file review)
+local function example_context_multiple()
+  local headless = require('opencode.headless')
+
+  headless.new():and_then(function(client)
+    print('Starting batch file review...')
+
+    return client:chat('Compare these files and explain how they interact', {
+      -- Multiple contexts for different files
+      contexts = {
+        {
+          current_file = '/path/to/api/handler.lua',
+          selections = {
+            {
+              content = 'function M.handle_request(req)\n  -- handler code\nend',
+              lines = '1, 10',
+            },
+          },
+        },
+        {
+          current_file = '/path/to/services/user.lua',
+          selections = {
+            {
+              content = 'function M.get_user(id)\n  -- service code\nend',
+              lines = '20, 30',
+            },
+          },
+        },
+        {
+          current_file = '/path/to/models/user.lua',
+          diagnostics = {
+            { message = 'Field may be nil', severity = 2, lnum = 5, col = 10 },
+          },
+        },
+      },
+    })
+  end):and_then(function(response)
+    print('\n=== Response ===')
+    print(response.text)
+  end):catch(function(err)
+    print('Error:', vim.inspect(err))
+  end)
+end
+
+---Example 12: Streaming with context
+local function example_context_streaming()
+  local headless = require('opencode.headless')
+  local permission_handler = require('opencode.headless.permission_handler')
+
+  headless.new():and_then(function(client)
+    print('Starting streaming chat with context...')
+
+    local _ = client:chat_stream('Review this file for bugs and fix them', {
+      context = {
+        current_file = vim.fn.expand('%:p'),
+        diagnostics = vim.diagnostic.get(0), -- Get diagnostics from current buffer
+      },
+      permission_handler = permission_handler.safe_defaults(),
+
+      on_data = function(chunk)
+        if chunk.text then
+          io.write(chunk.text)
+          io.flush()
+        end
+      end,
+
+      on_tool_call = function(tool_call)
+        print(string.format('\n[Tool] %s: %s', tool_call.name, tool_call.status))
+      end,
+
+      on_done = function()
+        print('\n\n=== Review complete ===')
+        client:close()
+      end,
+
+      on_error = function(err)
+        print('\nError:', vim.inspect(err))
+        client:close()
+      end,
+    })
+  end):catch(function(err)
+    print('Failed to create client:', vim.inspect(err))
+  end)
+end
+
+---Example 13: Chat with base64 images
+local function example_with_images()
+  local headless = require('opencode.headless')
+
+  -- Example: Read an image file and convert to base64
+  -- In practice, you might get this from clipboard, screenshot, etc.
+  local function read_image_as_base64(path)
+    local file = io.open(path, 'rb')
+    if not file then
+      return nil
+    end
+    local data = file:read('*all')
+    file:close()
+    -- Encode to base64 using vim's built-in function
+    return vim.base64.encode(data)
+  end
+
+  headless.new():and_then(function(client)
+    print('Starting chat with image...')
+
+    -- Example with a hardcoded tiny 1x1 red PNG (base64 encoded)
+    -- In practice, you'd read an actual image file
+    local tiny_red_png = 'iVBORw0KGgoAAAANSUhEUgAAAAEAAAABCAYAAAAfFcSJAAAADUlEQVR42mP8z8DwHwAFBQIAX8jx0gAAAABJRU5ErkJggg=='
+
+    return client:chat('What do you see in this image?', {
+      context = {
+        images = {
+          { data = tiny_red_png, format = 'png' },
+        },
+      },
+    })
+  end):and_then(function(response)
+    print('\n=== Response ===')
+    print(response.text)
+  end):catch(function(err)
+    print('Error:', vim.inspect(err))
+  end)
+end
+
+---Example 14: Chat with multiple images and context
+local function example_with_multiple_images()
+  local headless = require('opencode.headless')
+
+  headless.new():and_then(function(client)
+    print('Starting chat with multiple images...')
+
+    -- Example: Compare two screenshots
+    local screenshot1 = 'base64_encoded_image_data_1'
+    local screenshot2 = 'base64_encoded_image_data_2'
+
+    return client:chat('Compare these two UI screenshots and identify the differences', {
+      context = {
+        -- Include related code file for context
+        current_file = '/path/to/ui/component.tsx',
+        -- Multiple images to compare
+        images = {
+          { data = screenshot1, format = 'png' },
+          { data = screenshot2, format = 'png' },
+        },
+      },
+    })
+  end):and_then(function(response)
+    print('\n=== Response ===')
+    print(response.text)
+  end):catch(function(err)
+    print('Error:', vim.inspect(err))
+  end)
+end
+
+---Example 15: Streaming with image context
+local function example_image_streaming()
+  local headless = require('opencode.headless')
+  local permission_handler = require('opencode.headless.permission_handler')
+
+  headless.new():and_then(function(client)
+    print('Starting streaming chat with image...')
+
+    -- Example: Analyze an error screenshot and fix the code
+    local error_screenshot = 'base64_encoded_error_screenshot'
+
+    local _ = client:chat_stream('Fix the error shown in this screenshot', {
+      context = {
+        current_file = vim.fn.expand('%:p'),
+        images = {
+          { data = error_screenshot, format = 'png' },
+        },
+      },
+      permission_handler = permission_handler.safe_defaults(),
+
+      on_data = function(chunk)
+        if chunk.text then
+          io.write(chunk.text)
+          io.flush()
+        end
+      end,
+
+      on_tool_call = function(tool_call)
+        print(string.format('\n[Tool] %s: %s', tool_call.name, tool_call.status))
+      end,
+
+      on_done = function()
+        print('\n\n=== Done ===')
+        client:close()
+      end,
+
+      on_error = function(err)
+        print('\nError:', vim.inspect(err))
+        client:close()
+      end,
+    })
+  end):catch(function(err)
+    print('Failed to create client:', vim.inspect(err))
+  end)
+end
+
 -- Return examples for manual testing
 return {
   simple_chat = example_simple_chat,
@@ -388,4 +628,10 @@ return {
   tool_calls_safe = example_tool_calls_safe,
   tool_calls_custom = example_tool_calls_custom,
   tool_calls_rules = example_tool_calls_rules,
+  context_single = example_context_single,
+  context_multiple = example_context_multiple,
+  context_streaming = example_context_streaming,
+  with_images = example_with_images,
+  with_multiple_images = example_with_multiple_images,
+  image_streaming = example_image_streaming,
 }

@@ -132,22 +132,13 @@ function OpencodeHeadless:send_message(session_id, message, opts)
     return Promise.new():reject('Session not found: ' .. session_id)
   end
 
-  -- Build message parts
-  local parts = {}
-
-  -- Add context if provided
-  if opts.context then
-    -- TODO: Use context.format_message from context.lua
-    -- For now, just add the message as text
-    table.insert(parts, {
-      type = 'text',
-      text = message,
-    })
+  -- Build message parts using context if provided
+  local parts
+  if opts.context or opts.contexts then
+    local headless_context = require('opencode.headless.context')
+    parts = headless_context.format_parts(message, opts)
   else
-    table.insert(parts, {
-      type = 'text',
-      text = message,
-    })
+    parts = { { type = 'text', text = message } }
   end
 
   -- Build message data
@@ -367,21 +358,15 @@ function OpencodeHeadless:chat_stream(message, opts)
       -- Create stream handle
       stream_handle = StreamHandle.new(session.id, self.event_manager, self.api_client, callbacks)
       
-      -- Build message parts
-      local parts = {}
-      if opts.context then
-        -- TODO: Use context.format_message from context.lua
-        table.insert(parts, {
-          type = 'text',
-          text = message,
-        })
+      -- Build message parts using context if provided
+      local parts
+      if opts.context or opts.contexts then
+        local headless_context = require('opencode.headless.context')
+        parts = headless_context.format_parts(message, opts)
       else
-        table.insert(parts, {
-          type = 'text',
-          text = message,
-        })
+        parts = { { type = 'text', text = message } }
       end
-      
+
       -- Build message data
       local message_data = {
         parts = parts,

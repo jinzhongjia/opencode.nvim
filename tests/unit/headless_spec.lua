@@ -196,6 +196,115 @@ describe('opencode.headless', function()
       end
     end)
   end)
+
+  describe('abort', function()
+    it('aborts a specific session', function()
+      local instance, abort_result
+      headless.new()
+        :and_then(function(inst)
+          instance = inst
+          return instance:create_session()
+        end)
+        :and_then(function(session)
+          return instance:abort(session.id)
+        end)
+        :and_then(function(result)
+          abort_result = result
+        end)
+
+      vim.wait(200, function()
+        return abort_result ~= nil
+      end)
+
+      assert.is_true(abort_result)
+    end)
+
+    it('aborts all sessions when no session_id provided', function()
+      local instance, abort_result
+      headless.new()
+        :and_then(function(inst)
+          instance = inst
+          return instance:create_session()
+        end)
+        :and_then(function()
+          return instance:abort() -- no session_id
+        end)
+        :and_then(function(result)
+          abort_result = result
+        end)
+
+      vim.wait(200, function()
+        return abort_result ~= nil
+      end)
+
+      assert.is_true(abort_result)
+    end)
+  end)
+
+  describe('get_session', function()
+    it('returns cached session', function()
+      local instance, session, retrieved_session
+      headless.new()
+        :and_then(function(inst)
+          instance = inst
+          return instance:create_session()
+        end)
+        :and_then(function(sess)
+          session = sess
+          return instance:get_session(sess.id)
+        end)
+        :and_then(function(sess)
+          retrieved_session = sess
+        end)
+
+      vim.wait(200, function()
+        return retrieved_session ~= nil
+      end)
+
+      assert.is_not_nil(retrieved_session)
+      assert.equal(session.id, retrieved_session.id)
+    end)
+  end)
+
+  describe('list_sessions', function()
+    it('returns a Promise', function()
+      local instance
+      headless.new():and_then(function(inst)
+        instance = inst
+      end)
+
+      vim.wait(100, function()
+        return instance ~= nil
+      end)
+
+      if instance then
+        local promise = instance:list_sessions()
+        assert.is_table(promise)
+        assert.is_function(promise.and_then)
+      end
+    end)
+  end)
+
+  describe('send_message', function()
+    it('rejects when session not found', function()
+      local instance, error_msg
+      headless.new()
+        :and_then(function(inst)
+          instance = inst
+          return instance:send_message('non-existent-session', 'test')
+        end)
+        :catch(function(err)
+          error_msg = err
+        end)
+
+      vim.wait(200, function()
+        return error_msg ~= nil
+      end)
+
+      assert.is_not_nil(error_msg)
+      assert.is_truthy(error_msg:match('Session not found'))
+    end)
+  end)
 end)
 
 describe('opencode.headless.permission_handler', function()
@@ -385,6 +494,579 @@ describe('opencode.headless.permission_handler', function()
 
       -- Custom rule takes precedence
       assert.equal('always', bash_result)
+    end)
+  end)
+end)
+
+describe('opencode.headless.stream_handler', function()
+  local StreamHandle = require('opencode.headless.stream_handler')
+  local EventManager = require('opencode.event_manager')
+
+  describe('new', function()
+    it('creates a stream handle with required fields', function()
+      local event_manager = EventManager.new()
+      local mock_api_client = {
+        abort_session = function()
+          local p = Promise.new()
+          p:resolve(true)
+          return p
+        end,
+      }
+      local callbacks = {
+        on_data = function() end,
+        on_done = function() end,
+        on_error = function() end,
+      }
+
+      local handle = StreamHandle.new('test-session', event_manager, mock_api_client, callbacks)
+
+      assert.is_not_nil(handle)
+      assert.is_function(handle.abort)
+      assert.is_function(handle.is_done)
+      assert.is_function(handle.get_partial_text)
+      assert.is_function(handle.get_tool_calls)
+    end)
+  end)
+
+  describe('is_done', function()
+    it('returns false initially', function()
+      local event_manager = EventManager.new()
+      local mock_api_client = {}
+      local callbacks = {
+        on_data = function() end,
+        on_done = function() end,
+        on_error = function() end,
+      }
+
+      local handle = StreamHandle.new('test-session', event_manager, mock_api_client, callbacks)
+      assert.is_false(handle:is_done())
+    end)
+  end)
+
+  describe('get_partial_text', function()
+    it('returns empty string initially', function()
+      local event_manager = EventManager.new()
+      local mock_api_client = {}
+      local callbacks = {
+        on_data = function() end,
+        on_done = function() end,
+        on_error = function() end,
+      }
+
+      local handle = StreamHandle.new('test-session', event_manager, mock_api_client, callbacks)
+      assert.equal('', handle:get_partial_text())
+    end)
+  end)
+
+  describe('get_tool_calls', function()
+    it('returns empty table initially', function()
+      local event_manager = EventManager.new()
+      local mock_api_client = {}
+      local callbacks = {
+        on_data = function() end,
+        on_done = function() end,
+        on_error = function() end,
+      }
+
+      local handle = StreamHandle.new('test-session', event_manager, mock_api_client, callbacks)
+      local tool_calls = handle:get_tool_calls()
+      assert.is_table(tool_calls)
+      assert.equal(0, vim.tbl_count(tool_calls))
+    end)
+  end)
+
+  describe('abort', function()
+    it('returns a Promise', function()
+      local event_manager = EventManager.new()
+      local mock_api_client = {
+        abort_session = function()
+          local p = Promise.new()
+          p:resolve(true)
+          return p
+        end,
+      }
+      local callbacks = {
+        on_data = function() end,
+        on_done = function() end,
+        on_error = function() end,
+      }
+
+      local handle = StreamHandle.new('test-session', event_manager, mock_api_client, callbacks)
+      local result = handle:abort()
+      assert.is_table(result)
+      assert.is_function(result.and_then)
+    end)
+
+    it('returns false when already aborted', function()
+      local event_manager = EventManager.new()
+      local mock_api_client = {
+        abort_session = function()
+          local p = Promise.new()
+          p:resolve(true)
+          return p
+        end,
+      }
+      local callbacks = {
+        on_data = function() end,
+        on_done = function() end,
+        on_error = function() end,
+      }
+
+      local handle = StreamHandle.new('test-session', event_manager, mock_api_client, callbacks)
+
+      -- First abort
+      handle:abort()
+
+      -- Second abort should return false
+      local second_result
+      handle:abort():and_then(function(r)
+        second_result = r
+      end)
+
+      vim.wait(50, function()
+        return second_result ~= nil
+      end)
+
+      assert.is_false(second_result)
+    end)
+  end)
+end)
+
+describe('opencode.headless.context', function()
+  local headless_context = require('opencode.headless.context')
+
+  describe('normalize_file', function()
+    it('normalizes string path to HeadlessFileInfo', function()
+      local file = headless_context.normalize_file('/path/to/file.lua')
+      assert.equal('/path/to/file.lua', file.path)
+      assert.equal('file.lua', file.name)
+      assert.equal('lua', file.extension)
+    end)
+
+    it('fills missing fields in HeadlessFileInfo', function()
+      local file = headless_context.normalize_file({ path = '/path/to/script.py' })
+      assert.equal('/path/to/script.py', file.path)
+      assert.equal('script.py', file.name)
+      assert.equal('py', file.extension)
+    end)
+
+    it('preserves existing fields in HeadlessFileInfo', function()
+      local file = headless_context.normalize_file({
+        path = '/path/to/file.lua',
+        name = 'custom_name.lua',
+        extension = 'custom',
+      })
+      assert.equal('custom_name.lua', file.name)
+      assert.equal('custom', file.extension)
+    end)
+  end)
+
+  describe('normalize_contexts', function()
+    it('returns empty array when no context provided', function()
+      local contexts = headless_context.normalize_contexts({})
+      assert.equal(0, #contexts)
+    end)
+
+    it('wraps single context in array', function()
+      local contexts = headless_context.normalize_contexts({
+        context = { current_file = '/path/to/file.lua' },
+      })
+      assert.equal(1, #contexts)
+      assert.equal('/path/to/file.lua', contexts[1].current_file)
+    end)
+
+    it('returns contexts array as-is', function()
+      local contexts = headless_context.normalize_contexts({
+        contexts = {
+          { current_file = '/path/to/a.lua' },
+          { current_file = '/path/to/b.lua' },
+        },
+      })
+      assert.equal(2, #contexts)
+    end)
+
+    it('prefers contexts over context', function()
+      local contexts = headless_context.normalize_contexts({
+        context = { current_file = '/single.lua' },
+        contexts = {
+          { current_file = '/a.lua' },
+          { current_file = '/b.lua' },
+        },
+      })
+      assert.equal(2, #contexts)
+      assert.equal('/a.lua', contexts[1].current_file)
+    end)
+  end)
+
+  describe('normalize_selection', function()
+    it('normalizes selection with file', function()
+      local selection = { content = 'local x = 1', lines = '1, 1', file = '/path/to/file.lua' }
+      local result = headless_context.normalize_selection(selection)
+
+      assert.equal('local x = 1', result.content)
+      assert.equal('1, 1', result.lines)
+      assert.is_table(result.file)
+      assert.equal('/path/to/file.lua', result.file.path)
+    end)
+
+    it('uses default_file when selection.file is nil', function()
+      local selection = { content = 'local x = 1', lines = '1, 1' }
+      local default_file = { path = '/default/file.lua', name = 'file.lua', extension = 'lua' }
+      local result = headless_context.normalize_selection(selection, default_file)
+
+      assert.equal(default_file, result.file)
+    end)
+
+    it('returns nil file when no file provided', function()
+      local selection = { content = 'local x = 1', lines = '1, 1' }
+      local result = headless_context.normalize_selection(selection)
+
+      assert.is_nil(result.file)
+    end)
+  end)
+
+  describe('format_file_part', function()
+    it('formats file as message part', function()
+      local file = { path = '/home/user/project/src/main.lua', name = 'main.lua', extension = 'lua' }
+      local part = headless_context.format_file_part(file)
+
+      assert.equal('file', part.type)
+      assert.is_string(part.filename)
+      assert.equal('text/plain', part.mime)
+      assert.is_not_nil(part.url:match('^file://'))
+    end)
+
+    it('detects image MIME types', function()
+      local png_file = { path = '/path/to/image.png', name = 'image.png', extension = 'png' }
+      local part = headless_context.format_file_part(png_file)
+      assert.equal('image/png', part.mime)
+
+      local jpg_file = { path = '/path/to/photo.jpg', name = 'photo.jpg', extension = 'jpg' }
+      local jpg_part = headless_context.format_file_part(jpg_file)
+      assert.equal('image/jpeg', jpg_part.mime)
+    end)
+
+    it('includes source when mention found in prompt', function()
+      local file = { path = '/path/to/file.lua', name = 'file.lua', extension = 'lua' }
+      local rel_path = vim.fn.fnamemodify(file.path, ':~:.')
+      local prompt = 'review @' .. rel_path .. ' please'
+      local part = headless_context.format_file_part(file, prompt)
+
+      assert.is_not_nil(part.source)
+      assert.equal('file', part.source.type)
+    end)
+  end)
+
+  describe('format_subagent_part', function()
+    it('formats subagent as agent part', function()
+      local part = headless_context.format_subagent_part('plan', 'use @plan to help')
+
+      assert.equal('agent', part.type)
+      assert.equal('plan', part.name)
+      assert.is_not_nil(part.source)
+      assert.equal('@plan', part.source.value)
+    end)
+
+    it('calculates correct position when mention found', function()
+      local part = headless_context.format_subagent_part('build', 'please @build this')
+
+      assert.equal(7, part.source.start) -- 0-based index of '@build'
+      assert.equal(13, part.source['end']) -- start + length of '@build'
+    end)
+
+    it('uses position 0 when mention not found', function()
+      local part = headless_context.format_subagent_part('plan', 'no mention here')
+
+      assert.equal(0, part.source.start)
+    end)
+  end)
+
+  describe('format_selection_part', function()
+    it('formats selection as synthetic text part', function()
+      local selection = {
+        file = { path = '/path/to/file.lua', name = 'file.lua', extension = 'lua' },
+        content = 'local x = 1',
+        lines = '10, 12',
+      }
+      local part = headless_context.format_selection_part(selection)
+
+      assert.equal('text', part.type)
+      assert.is_true(part.synthetic)
+      assert.is_string(part.text)
+
+      local decoded = vim.json.decode(part.text)
+      assert.equal('selection', decoded.context_type)
+      assert.equal('10, 12', decoded.lines)
+    end)
+  end)
+
+  describe('format_diagnostics_part', function()
+    it('formats diagnostics as synthetic text part', function()
+      local diagnostics = {
+        { message = 'unused variable x', severity = 2, lnum = 10, col = 5 },
+        { message = 'missing return', severity = 1, lnum = 20, col = 1 },
+      }
+      local part = headless_context.format_diagnostics_part(diagnostics)
+
+      assert.equal('text', part.type)
+      assert.is_true(part.synthetic)
+
+      local decoded = vim.json.decode(part.text)
+      assert.equal('diagnostics', decoded.context_type)
+      assert.equal(2, #decoded.content)
+    end)
+  end)
+
+  describe('format_parts', function()
+    it('returns prompt-only parts when no context', function()
+      local parts = headless_context.format_parts('hello world', {})
+      assert.equal(1, #parts)
+      assert.equal('text', parts[1].type)
+      assert.equal('hello world', parts[1].text)
+    end)
+
+    it('includes mentioned files', function()
+      local parts = headless_context.format_parts('review this', {
+        context = {
+          mentioned_files = { '/path/to/file.lua' },
+        },
+      })
+
+      assert.is_true(#parts >= 2)
+      assert.equal('text', parts[1].type)
+
+      local has_file_part = false
+      for _, part in ipairs(parts) do
+        if part.type == 'file' then
+          has_file_part = true
+          break
+        end
+      end
+      assert.is_true(has_file_part)
+    end)
+
+    it('includes current file', function()
+      local parts = headless_context.format_parts('fix this', {
+        context = {
+          current_file = '/path/to/main.lua',
+        },
+      })
+
+      local has_file_part = false
+      for _, part in ipairs(parts) do
+        if part.type == 'file' then
+          has_file_part = true
+          break
+        end
+      end
+      assert.is_true(has_file_part)
+    end)
+
+    it('includes selections', function()
+      local parts = headless_context.format_parts('explain this', {
+        context = {
+          selections = {
+            { content = 'local x = 1', lines = '1, 1' },
+          },
+        },
+      })
+
+      local has_selection = false
+      for _, part in ipairs(parts) do
+        if part.synthetic and part.text then
+          local ok, decoded = pcall(vim.json.decode, part.text)
+          if ok and decoded.context_type == 'selection' then
+            has_selection = true
+            break
+          end
+        end
+      end
+      assert.is_true(has_selection)
+    end)
+
+    it('includes diagnostics', function()
+      local parts = headless_context.format_parts('fix errors', {
+        context = {
+          diagnostics = {
+            { message = 'error here', lnum = 1, col = 1 },
+          },
+        },
+      })
+
+      local has_diagnostics = false
+      for _, part in ipairs(parts) do
+        if part.synthetic and part.text then
+          local ok, decoded = pcall(vim.json.decode, part.text)
+          if ok and decoded.context_type == 'diagnostics' then
+            has_diagnostics = true
+            break
+          end
+        end
+      end
+      assert.is_true(has_diagnostics)
+    end)
+
+    it('handles multiple contexts (flat merge)', function()
+      local parts = headless_context.format_parts('review all', {
+        contexts = {
+          { current_file = '/path/to/a.lua' },
+          { current_file = '/path/to/b.lua' },
+        },
+      })
+
+      local file_count = 0
+      for _, part in ipairs(parts) do
+        if part.type == 'file' then
+          file_count = file_count + 1
+        end
+      end
+      assert.equal(2, file_count)
+    end)
+
+    it('avoids duplicate files', function()
+      local parts = headless_context.format_parts('review', {
+        contexts = {
+          { mentioned_files = { '/path/to/file.lua' } },
+          { mentioned_files = { '/path/to/file.lua' } },
+        },
+      })
+
+      local file_count = 0
+      for _, part in ipairs(parts) do
+        if part.type == 'file' then
+          file_count = file_count + 1
+        end
+      end
+      assert.equal(1, file_count)
+    end)
+
+    it('does not duplicate current_file in mentioned_files', function()
+      local parts = headless_context.format_parts('review', {
+        context = {
+          current_file = '/path/to/main.lua',
+          mentioned_files = { '/path/to/main.lua', '/path/to/other.lua' },
+        },
+      })
+
+      local file_count = 0
+      for _, part in ipairs(parts) do
+        if part.type == 'file' then
+          file_count = file_count + 1
+        end
+      end
+      -- Should have other.lua + main.lua (current_file), but main.lua only once
+      assert.equal(2, file_count)
+    end)
+  end)
+
+  describe('format_image_part', function()
+    it('formats base64 image with default png format', function()
+      local image = { data = 'iVBORw0KGgoAAAANSUhEUgAAAAEAAAABCAYAAAAfFcSJAAAADUlEQVR42mNk+M9QDwADhgGAWjR9awAAAABJRU5ErkJggg==' }
+      local part = headless_context.format_image_part(image)
+
+      assert.equal('file', part.type)
+      assert.equal('image_1.png', part.filename)
+      assert.equal('image/png', part.mime)
+      assert.is_not_nil(part.url:match('^data:image/png;base64,'))
+    end)
+
+    it('formats base64 image with specified format', function()
+      local image = { data = 'fakebase64data', format = 'jpeg' }
+      local part = headless_context.format_image_part(image)
+
+      assert.equal('file', part.type)
+      assert.equal('image_1.jpeg', part.filename)
+      assert.equal('image/jpeg', part.mime)
+      assert.is_not_nil(part.url:match('^data:image/jpeg;base64,'))
+    end)
+
+    it('uses index for unique filenames', function()
+      local image = { data = 'fakedata', format = 'webp' }
+      local part = headless_context.format_image_part(image, 3)
+
+      assert.equal('image_3.webp', part.filename)
+    end)
+
+    it('normalizes format to lowercase', function()
+      local image = { data = 'fakedata', format = 'PNG' }
+      local part = headless_context.format_image_part(image)
+
+      assert.equal('image/png', part.mime)
+      assert.equal('image_1.png', part.filename)
+    end)
+
+    it('handles gif format', function()
+      local image = { data = 'fakegif', format = 'gif' }
+      local part = headless_context.format_image_part(image)
+
+      assert.equal('image/gif', part.mime)
+    end)
+  end)
+
+  describe('format_parts with images', function()
+    it('includes images in parts', function()
+      local parts = headless_context.format_parts('describe this image', {
+        context = {
+          images = {
+            { data = 'base64imagedata', format = 'png' },
+          },
+        },
+      })
+
+      local has_image = false
+      for _, part in ipairs(parts) do
+        if part.type == 'file' and part.mime == 'image/png' then
+          has_image = true
+          break
+        end
+      end
+      assert.is_true(has_image)
+    end)
+
+    it('includes multiple images with unique indices', function()
+      local parts = headless_context.format_parts('compare these images', {
+        context = {
+          images = {
+            { data = 'image1data', format = 'png' },
+            { data = 'image2data', format = 'jpeg' },
+          },
+        },
+      })
+
+      local image_parts = {}
+      for _, part in ipairs(parts) do
+        if part.type == 'file' and part.mime:match('^image/') then
+          table.insert(image_parts, part)
+        end
+      end
+      assert.equal(2, #image_parts)
+      assert.equal('image_1.png', image_parts[1].filename)
+      assert.equal('image_2.jpeg', image_parts[2].filename)
+    end)
+
+    it('includes images alongside other context', function()
+      local parts = headless_context.format_parts('analyze code and image', {
+        context = {
+          current_file = '/path/to/code.lua',
+          images = {
+            { data = 'screenshotdata', format = 'png' },
+          },
+        },
+      })
+
+      local has_file = false
+      local has_image = false
+      for _, part in ipairs(parts) do
+        if part.type == 'file' then
+          if part.mime == 'text/plain' then
+            has_file = true
+          elseif part.mime == 'image/png' then
+            has_image = true
+          end
+        end
+      end
+      assert.is_true(has_file)
+      assert.is_true(has_image)
     end)
   end)
 end)
