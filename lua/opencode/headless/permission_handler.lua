@@ -55,8 +55,12 @@ function M.match_pattern(name, pattern)
     return true
   end
 
-  -- Convert glob pattern to Lua pattern
-  local lua_pattern = pattern:gsub('%*', '.*'):gsub('%-', '%%-')
+  -- Escape all Lua pattern special characters except '*'
+  -- Special chars: ( ) . % + - * ? [ ] ^ $
+  local lua_pattern = pattern
+    :gsub('([%(%)%.%%%+%-%?%[%]%^%$])', '%%%1') -- Escape special chars
+    :gsub('%*', '.*') -- Convert glob '*' to Lua '.*'
+
   return name:match('^' .. lua_pattern .. '$') ~= nil
 end
 

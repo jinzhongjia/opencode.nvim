@@ -25,6 +25,8 @@ local Promise = require('opencode.promise')
 ---@field private cleanup_handlers function[]
 ---@field private tool_calls table<string, ToolCallInfo>
 ---@field private pending_permissions table<string, boolean>
+---@field private text_parts table<string, string> Track text content by part ID
+---@field private text_parts_order string[] Track order of text parts
 local StreamHandle = {}
 StreamHandle.__index = StreamHandle
 
@@ -61,6 +63,8 @@ function StreamHandle.new(session_id, event_manager, api_client, callbacks, perm
     cleanup_handlers = {},
     tool_calls = {},
     pending_permissions = {},
+    text_parts = {},
+    text_parts_order = {},
   }, StreamHandle)
 
   self:_setup_listeners()
@@ -76,9 +80,10 @@ function StreamHandle:_setup_listeners()
 
   -- Listen for the initial message creation (to get message_id)
   on_message_updated = function(data)
-    if data.sessionID == self.session_id and data.role == 'assistant' then
+    -- data is EventMessageUpdated.properties = {info: MessageInfo}
+    if data.info and data.info.sessionID == self.session_id and data.info.role == 'assistant' then
       if not self.message_id then
-        self.message_id = data.id
+        self.message_id = data.info.id
       end
     end
   end
@@ -89,29 +94,56 @@ function StreamHandle:_setup_listeners()
       return
     end
 
-    -- Filter by session
-    if data.sessionID ~= self.session_id then
-      return
-    end
-    if self.message_id and data.messageID ~= self.message_id then
-      return
-    end
-
+    -- data is EventMessagePartUpdated.properties = {part: OpencodeMessagePart}
     local part = data.part
     if not part then
       return
     end
 
+    -- Filter by session (sessionID and messageID are part properties)
+    if part.sessionID ~= self.session_id then
+      return
+    end
+    if self.message_id and part.messageID ~= self.message_id then
+      return
+    end
+
     -- Handle text parts
     if part.type == 'text' and part.text then
-      self.partial_text = self.partial_text .. part.text
+      -- Track text by part ID to handle updates correctly
+      -- Events send complete part content, not incremental deltas
+      local part_id = part.id or 'default_text'
+      local prev_text = self.text_parts[part_id] or ''
+      local is_new_part = (prev_text == '')
 
-      -- Call user callback for text data
-      if self.callbacks.on_data then
+      self.text_parts[part_id] = part.text
+
+      -- Track order of parts (only add if new)
+      if is_new_part then
+        table.insert(self.text_parts_order, part_id)
+      end
+
+      -- Calculate the delta (new text that was added)
+      local delta_text = ''
+      if #part.text > #prev_text then
+        delta_text = part.text:sub(#prev_text + 1)
+      elseif part.text ~= prev_text then
+        -- Text was replaced entirely, use the full new text
+        delta_text = part.text
+      end
+
+      -- Update partial_text by reconstructing from all text parts (in order)
+      self.partial_text = ''
+      for _, pid in ipairs(self.text_parts_order) do
+        self.partial_text = self.partial_text .. (self.text_parts[pid] or '')
+      end
+
+      -- Call user callback for text data (with delta)
+      if self.callbacks.on_data and delta_text ~= '' then
         vim.schedule(function()
           self.callbacks.on_data({
             type = part.type,
-            text = part.text,
+            text = delta_text,
             part = part,
           })
         end)
@@ -125,6 +157,7 @@ function StreamHandle:_setup_listeners()
   end
 
   -- Listen for permission requests
+  -- data is EventPermissionUpdated.properties = OpencodePermission
   on_permission_updated = function(data)
     if data.sessionID ~= self.session_id then
       return
@@ -133,12 +166,12 @@ function StreamHandle:_setup_listeners()
       return
     end
 
-    -- Mark permission as pending
-    self.pending_permissions[data.permissionID] = true
+    -- Mark permission as pending (OpencodePermission uses 'id' field)
+    self.pending_permissions[data.id] = true
 
     -- Build permission request object
     local permission_request = {
-      id = data.permissionID,
+      id = data.id,
       session_id = self.session_id,
       message_id = data.messageID or self.message_id,
       tool_name = data.type or 'unknown',
@@ -265,24 +298,40 @@ end
 function StreamHandle:_handle_permission(permission)
   -- Try permission handler first
   if self.permission_handler then
-    self.permission_handler:handle(permission):and_then(function(response)
-      self:_respond_to_permission(permission.id, response)
-    end)
+    self.permission_handler:handle(permission)
+      :and_then(function(response)
+        self:_respond_to_permission(permission.id, response)
+      end)
+      :catch(function()
+        -- On error, default to reject
+        self:_respond_to_permission(permission.id, 'reject')
+      end)
     return
   end
 
   -- Try user callback
   if self.callbacks.on_permission then
-    local result = self.callbacks.on_permission(permission)
+    local ok, result = pcall(self.callbacks.on_permission, permission)
+
+    if not ok then
+      -- Callback threw an error, default to reject
+      self:_respond_to_permission(permission.id, 'reject')
+      return
+    end
 
     -- Handle sync or async response
     if type(result) == 'string' then
       self:_respond_to_permission(permission.id, result)
     elseif type(result) == 'table' and result.and_then then
       -- It's a Promise
-      result:and_then(function(response)
-        self:_respond_to_permission(permission.id, response)
-      end)
+      result
+        :and_then(function(response)
+          self:_respond_to_permission(permission.id, response)
+        end)
+        :catch(function()
+          -- On error, default to reject
+          self:_respond_to_permission(permission.id, 'reject')
+        end)
     else
       -- Unknown, default to reject
       self:_respond_to_permission(permission.id, 'reject')
@@ -323,17 +372,20 @@ end
 ---@return Promise<boolean>
 function StreamHandle:abort()
   if self.is_completed or self.is_aborted then
-    local p = Promise.new()
-    p:resolve(false)
-    return p
+    return Promise.new():resolve(false)
   end
 
   self.is_aborted = true
   self:_cleanup()
 
-  return self.api_client:abort_session(self.session_id):and_then(function()
-    return true
-  end)
+  return self.api_client:abort_session(self.session_id)
+    :and_then(function()
+      return true
+    end)
+    :catch(function()
+      -- Abort failed, but we've already cleaned up locally
+      return false
+    end)
 end
 
 ---Check if the stream is done

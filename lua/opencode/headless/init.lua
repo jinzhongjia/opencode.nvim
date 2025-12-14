@@ -4,6 +4,7 @@ local EventManager = require('opencode.event_manager')
 local session_utils = require('opencode.session')
 local server_job = require('opencode.server_job')
 local retry_module = require('opencode.headless.retry')
+local permission_handler_module = require('opencode.headless.permission_handler')
 
 ---@class RetryConfig
 ---@field max_attempts? number Maximum number of retry attempts (default: 3)
@@ -20,6 +21,7 @@ local retry_module = require('opencode.headless.retry')
 ---@field directory? string Working directory (default: cwd)
 ---@field timeout? number Timeout in milliseconds (default: 120000)
 ---@field retry? RetryConfig|boolean Retry configuration (true for defaults, false to disable)
+---@field permission_handler? PermissionHandlerConfig Permission handling configuration
 
 ---@class OpencodeHeadless
 ---@field private config OpencodeHeadlessConfig
@@ -28,6 +30,7 @@ local retry_module = require('opencode.headless.retry')
 ---@field private active_sessions table<string, Session>
 ---@field private server OpencodeServer|nil
 ---@field private retry_config RetryConfig|nil
+---@field private permission_handler PermissionHandler|nil
 local OpencodeHeadless = {}
 OpencodeHeadless.__index = OpencodeHeadless
 
@@ -74,6 +77,12 @@ function OpencodeHeadless.new(opts)
       local event_manager = EventManager.new()
       event_manager:start()
 
+      -- Create permission handler if configured
+      local permission_handler = nil
+      if opts.permission_handler then
+        permission_handler = permission_handler_module.new(opts.permission_handler)
+      end
+
       local instance = setmetatable({
         config = config,
         api_client = api_client,
@@ -81,6 +90,7 @@ function OpencodeHeadless.new(opts)
         active_sessions = {}, -- Track sessions we're using
         server = server,
         retry_config = retry_config,
+        permission_handler = permission_handler,
       }, OpencodeHeadless)
 
       promise:resolve(instance)
@@ -258,7 +268,7 @@ function OpencodeHeadless:_send_and_wait_for_response(session_id, message_data, 
 
   -- Listen for message updates for this session
   on_message_updated = function(data)
-    if data.info.sessionID == session_id and data.info.role == 'assistant' then
+    if data.info and data.info.sessionID == session_id and data.info.role == 'assistant' then
       -- Store the assistant message ID
       assistant_message_id = data.info.id
     end
@@ -304,11 +314,8 @@ function OpencodeHeadless:_send_and_wait_for_response(session_id, message_data, 
 
   -- Send the message
   self.api_client:create_message(session_id, message_data):catch(function(err)
-    -- Unsubscribe from events on error
-    self.event_manager:unsubscribe('message.updated', on_message_updated)
-    self.event_manager:unsubscribe('session.idle', on_session_idle)
-    self.event_manager:unsubscribe('session.error', on_session_error)
-
+    -- Clean up on error (also cancels timeout timer)
+    cleanup()
     promise:reject(err)
   end)
 
@@ -358,13 +365,47 @@ end
 function OpencodeHeadless:abort(session_id)
   if session_id then
     return self.api_client:abort_session(session_id)
+      :and_then(function()
+        return true
+      end)
+      :catch(function()
+        return false
+      end)
   else
     -- Abort all active sessions
-    local promises = {}
+    local session_ids = {}
     for sid, _ in pairs(self.active_sessions) do
-      table.insert(promises, self.api_client:abort_session(sid))
+      table.insert(session_ids, sid)
     end
-    return Promise.new():resolve(true) -- For now, just resolve
+
+    if #session_ids == 0 then
+      return Promise.new():resolve(true)
+    end
+
+    -- Chain abort calls sequentially and track results
+    local result_promise = Promise.new()
+    local all_success = true
+    local completed = 0
+    local total = #session_ids
+
+    for _, sid in ipairs(session_ids) do
+      self.api_client:abort_session(sid)
+        :and_then(function()
+          completed = completed + 1
+          if completed == total then
+            result_promise:resolve(all_success)
+          end
+        end)
+        :catch(function()
+          all_success = false
+          completed = completed + 1
+          if completed == total then
+            result_promise:resolve(all_success)
+          end
+        end)
+    end
+
+    return result_promise
   end
 end
 
@@ -374,9 +415,53 @@ end
 ---@return StreamHandle
 function OpencodeHeadless:chat_stream(message, opts)
   local StreamHandle = require('opencode.headless.stream_handler')
-  
+
   opts = opts or {}
-  
+
+  -- Create a proxy handle that forwards to the real handle once ready
+  -- This allows returning immediately while the session is being created
+  local real_handle = nil
+  local pending_abort = false
+  local is_ready = false
+
+  local proxy_handle = {
+    ---@return Promise<boolean>
+    abort = function()
+      if real_handle then
+        return real_handle:abort()
+      end
+      -- Mark for abort when handle becomes ready
+      pending_abort = true
+      return Promise.new():resolve(true)
+    end,
+    ---@return boolean
+    is_done = function()
+      if real_handle then
+        return real_handle:is_done()
+      end
+      return pending_abort
+    end,
+    ---@return string
+    get_partial_text = function()
+      if real_handle then
+        return real_handle:get_partial_text()
+      end
+      return ''
+    end,
+    ---@return table<string, ToolCallInfo>
+    get_tool_calls = function()
+      if real_handle then
+        return real_handle:get_tool_calls()
+      end
+      return {}
+    end,
+    ---Check if the handle is ready (session created, streaming started)
+    ---@return boolean
+    is_ready = function()
+      return is_ready
+    end,
+  }
+
   -- Use existing session or create new one
   local session_promise
   if opts.session_id then
@@ -403,23 +488,48 @@ function OpencodeHeadless:chat_stream(message, opts)
     -- Create new session (default behavior)
     session_promise = self:_create_new_session(opts.model or self.config.model, opts.agent or self.config.agent)
   end
-  
-  -- Create stream handle first (to return immediately)
-  local stream_handle = nil
-  
+
   -- Start the streaming process
   session_promise
     :and_then(function(session)
-      -- Create callbacks wrapper
+      -- Check if abort was requested before we got the session
+      if pending_abort then
+        if opts.on_done then
+          vim.schedule(function()
+            opts.on_done({ parts = {}, info = { role = 'assistant' } })
+          end)
+        end
+        return
+      end
+
+      -- Create callbacks wrapper with all callbacks
       local callbacks = {
         on_data = opts.on_data or function() end,
+        on_tool_call = opts.on_tool_call,
+        on_permission = opts.on_permission,
         on_done = opts.on_done or function() end,
         on_error = opts.on_error or function() end,
       }
-      
-      -- Create stream handle
-      stream_handle = StreamHandle.new(session.id, self.event_manager, self.api_client, callbacks)
-      
+
+      -- Determine which permission handler to use
+      -- Priority: opts.permission_handler > self.permission_handler
+      local permission_handler = nil
+      if opts.permission_handler then
+        permission_handler = permission_handler_module.new(opts.permission_handler)
+      else
+        permission_handler = self.permission_handler
+      end
+
+      -- Create stream handle with all callbacks and permission handler
+      real_handle = StreamHandle.new(
+        session.id,
+        self.event_manager,
+        self.api_client,
+        callbacks,
+        permission_handler
+      )
+      is_ready = true
+
       -- Build message parts using context if provided
       local parts
       if opts.context or opts.contexts then
@@ -433,7 +543,7 @@ function OpencodeHeadless:chat_stream(message, opts)
       local message_data = {
         parts = parts,
       }
-      
+
       -- Add model if specified
       local model = opts.model or self.config.model
       if model then
@@ -445,61 +555,26 @@ function OpencodeHeadless:chat_stream(message, opts)
           }
         end
       end
-      
+
       -- Add agent if specified
       local agent = opts.agent or self.config.agent
       if agent then
         message_data.agent = agent
       end
-      
+
       -- Send the message (this will trigger streaming events)
       return self.api_client:create_message(session.id, message_data)
     end)
     :catch(function(err)
-      -- If stream handle exists, call error callback
-      if stream_handle and opts.on_error then
+      -- Call error callback
+      if opts.on_error then
         vim.schedule(function()
           opts.on_error(err)
         end)
       end
     end)
-  
-  -- Return a placeholder stream handle that will be replaced
-  -- We need to return something immediately, so we create a dummy handle
-  local dummy_handle = {
-    abort = function()
-      return Promise.new():resolve(false)
-    end,
-    is_done = function()
-      return true
-    end,
-    get_partial_text = function()
-      return ''
-    end,
-    get_tool_calls = function()
-      return {}
-    end,
-  }
 
-  -- Replace with real handle once created
-  session_promise:and_then(function()
-    if stream_handle then
-      dummy_handle.abort = function()
-        return stream_handle:abort()
-      end
-      dummy_handle.is_done = function()
-        return stream_handle:is_done()
-      end
-      dummy_handle.get_partial_text = function()
-        return stream_handle:get_partial_text()
-      end
-      dummy_handle.get_tool_calls = function()
-        return stream_handle:get_tool_calls()
-      end
-    end
-  end)
-  
-  return dummy_handle
+  return proxy_handle
 end
 
 ---Close the headless client and cleanup resources

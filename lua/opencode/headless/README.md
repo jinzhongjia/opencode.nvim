@@ -102,6 +102,7 @@ Creates a new headless client instance.
   - `directory` (string): Working directory (default: current directory)
   - `timeout` (number): Timeout in milliseconds (default: `120000`)
   - `retry` (RetryConfig): Retry configuration (see below)
+  - `permission_handler` (PermissionHandlerConfig): Default permission handling configuration
 
 **Returns:** `Promise<OpencodeHeadless>`
 
@@ -179,8 +180,11 @@ Sends a message and receives streaming response.
 - `message` (string): The message to send
 - `opts` (ChatStreamOptions): Streaming options
   - `on_data` (function): Callback for incremental data `fun(chunk: MessageChunk): nil`
+  - `on_tool_call` (function, optional): Callback for tool call updates `fun(tool_call: ToolCallInfo): nil`
+  - `on_permission` (function, optional): Callback for permission requests `fun(permission: PermissionRequest): PermissionResponse|Promise`
   - `on_done` (function): Completion callback `fun(message: OpencodeMessage): nil`
   - `on_error` (function): Error callback `fun(error: any): nil`
+  - `permission_handler` (PermissionHandlerConfig, optional): Override default permission handler
   - Other options same as `chat()`
 
 **Returns:** `StreamHandle`
@@ -188,7 +192,9 @@ Sends a message and receives streaming response.
 StreamHandle object contains:
 - `abort()`: Abort streaming response, returns `Promise<boolean>`
 - `is_done()`: Check if complete, returns `boolean`
+- `is_ready()`: Check if handle is ready (session created, streaming started), returns `boolean`
 - `get_partial_text()`: Get current accumulated text, returns `string`
+- `get_tool_calls()`: Get all tool calls so far, returns `table<string, ToolCallInfo>`
 
 **Example:**
 ```lua

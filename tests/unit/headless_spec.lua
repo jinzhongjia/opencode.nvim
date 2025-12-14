@@ -305,6 +305,271 @@ describe('opencode.headless', function()
       assert.is_truthy(error_msg:match('Session not found'))
     end)
   end)
+
+  describe('chat', function()
+    it('returns a Promise', function()
+      local instance
+      headless.new():and_then(function(inst)
+        instance = inst
+      end)
+
+      vim.wait(100, function()
+        return instance ~= nil
+      end)
+
+      if instance then
+        local result = instance:chat('test message')
+        assert.is_table(result)
+        assert.is_function(result.and_then)
+      end
+    end)
+
+    it('creates a new session by default', function()
+      local instance, session_count_before, session_count_after
+      headless.new()
+        :and_then(function(inst)
+          instance = inst
+          session_count_before = vim.tbl_count(inst.active_sessions)
+          return inst:chat('test')
+        end)
+        :catch(function()
+          -- Expected to fail without full mock, but session should be created
+          if instance then
+            session_count_after = vim.tbl_count(instance.active_sessions)
+          end
+        end)
+
+      vim.wait(200, function()
+        return session_count_after ~= nil or (instance and vim.tbl_count(instance.active_sessions) > 0)
+      end)
+
+      if instance then
+        assert.is_true(vim.tbl_count(instance.active_sessions) > session_count_before)
+      end
+    end)
+
+    it('uses existing session when new_session=false', function()
+      local instance, used_session_id
+      local create_session_count = 0
+
+      -- Track create_session calls
+      local api_client_module = require('opencode.api_client')
+      local original_create = api_client_module.create
+      api_client_module.create = function()
+        return {
+          create_session = function()
+            create_session_count = create_session_count + 1
+            return Promise.new():resolve({
+              id = 'session-' .. create_session_count,
+              directory = '/test',
+            })
+          end,
+          abort_session = function()
+            return Promise.new():resolve(true)
+          end,
+        }
+      end
+
+      headless.new()
+        :and_then(function(inst)
+          instance = inst
+          return inst:create_session()
+        end)
+        :and_then(function(session)
+          used_session_id = session.id
+          -- Call chat with new_session=false
+          return instance:chat('test', { new_session = false })
+        end)
+        :catch(function() end)
+
+      vim.wait(200, function()
+        return create_session_count >= 1
+      end)
+
+      -- Should have only created 1 session (the explicit create_session call)
+      -- The chat with new_session=false should reuse it
+      assert.equal(1, create_session_count)
+
+      api_client_module.create = original_create
+    end)
+
+    it('uses specified session_id', function()
+      local instance
+      headless.new()
+        :and_then(function(inst)
+          instance = inst
+          return inst:create_session()
+        end)
+        :and_then(function(session)
+          -- Chat with specific session_id
+          return instance:chat('test', { session_id = session.id })
+        end)
+        :catch(function() end)
+
+      vim.wait(200, function()
+        return instance ~= nil
+      end)
+
+      -- Just verify it doesn't crash
+      assert.is_not_nil(instance)
+    end)
+  end)
+
+  describe('chat_stream callbacks', function()
+    it('calls on_error when session creation fails', function()
+      local error_received
+      local api_client_module = require('opencode.api_client')
+      local original_create = api_client_module.create
+
+      api_client_module.create = function()
+        return {
+          create_session = function()
+            return Promise.new():reject('Session creation failed')
+          end,
+          abort_session = function()
+            return Promise.new():resolve(true)
+          end,
+        }
+      end
+
+      local instance
+      headless.new()
+        :and_then(function(inst)
+          instance = inst
+          inst:chat_stream('test', {
+            on_data = function() end,
+            on_done = function() end,
+            on_error = function(err)
+              error_received = err
+            end,
+          })
+        end)
+
+      vim.wait(200, function()
+        return error_received ~= nil
+      end)
+
+      assert.is_not_nil(error_received)
+
+      api_client_module.create = original_create
+    end)
+
+    it('handles pending_abort before session ready', function()
+      local instance
+      local done_called = false
+
+      headless.new():and_then(function(inst)
+        instance = inst
+      end)
+
+      vim.wait(100, function()
+        return instance ~= nil
+      end)
+
+      if instance then
+        local handle = instance:chat_stream('test', {
+          on_data = function() end,
+          on_done = function()
+            done_called = true
+          end,
+          on_error = function() end,
+        })
+
+        -- Abort immediately before session is ready
+        handle.abort()
+
+        vim.wait(200, function()
+          return done_called or handle.is_done()
+        end)
+
+        assert.is_true(handle.is_done())
+      end
+    end)
+
+    it('proxy handle forwards methods to real handle', function()
+      local instance
+      headless.new():and_then(function(inst)
+        instance = inst
+      end)
+
+      vim.wait(100, function()
+        return instance ~= nil
+      end)
+
+      if instance then
+        local handle = instance:chat_stream('test', {
+          on_data = function() end,
+          on_done = function() end,
+          on_error = function() end,
+        })
+
+        -- Initial state
+        assert.is_false(handle.is_ready())
+        assert.equal('', handle.get_partial_text())
+        assert.is_table(handle.get_tool_calls())
+      end
+    end)
+  end)
+
+  describe('abort edge cases', function()
+    it('returns true when no active sessions', function()
+      local instance, abort_result
+      headless.new()
+        :and_then(function(inst)
+          instance = inst
+          -- Don't create any sessions, just abort
+          return instance:abort()
+        end)
+        :and_then(function(result)
+          abort_result = result
+        end)
+
+      vim.wait(200, function()
+        return abort_result ~= nil
+      end)
+
+      assert.is_true(abort_result)
+    end)
+
+    it('handles abort_session failure gracefully', function()
+      local api_client_module = require('opencode.api_client')
+      local original_create = api_client_module.create
+      local abort_result
+
+      api_client_module.create = function()
+        return {
+          create_session = function()
+            return Promise.new():resolve({ id = 'test-session' })
+          end,
+          abort_session = function()
+            return Promise.new():reject('Abort failed')
+          end,
+        }
+      end
+
+      headless.new()
+        :and_then(function(inst)
+          return inst:create_session():and_then(function()
+            return inst:abort('test-session')
+          end)
+        end)
+        :and_then(function(result)
+          abort_result = result
+        end)
+        :catch(function()
+          abort_result = false
+        end)
+
+      vim.wait(200, function()
+        return abort_result ~= nil
+      end)
+
+      -- Should return false, not reject
+      assert.is_false(abort_result)
+
+      api_client_module.create = original_create
+    end)
+  end)
 end)
 
 describe('opencode.headless.permission_handler', function()
@@ -628,6 +893,729 @@ describe('opencode.headless.stream_handler', function()
       end)
 
       assert.is_false(second_result)
+    end)
+
+    it('handles abort_session failure gracefully', function()
+      local event_manager = EventManager.new()
+      local mock_api_client = {
+        abort_session = function()
+          return Promise.new():reject('Abort failed')
+        end,
+      }
+      local callbacks = {
+        on_data = function() end,
+        on_done = function() end,
+        on_error = function() end,
+      }
+
+      local handle = StreamHandle.new('test-session', event_manager, mock_api_client, callbacks)
+      local abort_result
+
+      handle:abort():and_then(function(r)
+        abort_result = r
+      end)
+
+      vim.wait(50, function()
+        return abort_result ~= nil
+      end)
+
+      -- Should return false, not reject
+      assert.is_false(abort_result)
+    end)
+  end)
+
+  describe('event handling', function()
+    it('updates message_id on message.updated event', function()
+      local event_manager = EventManager.new()
+      event_manager:start()
+
+      local mock_api_client = {
+        abort_session = function()
+          return Promise.new():resolve(true)
+        end,
+      }
+      local callbacks = {
+        on_data = function() end,
+        on_done = function() end,
+        on_error = function() end,
+      }
+
+      local handle = StreamHandle.new('test-session', event_manager, mock_api_client, callbacks)
+
+      -- Simulate message.updated event
+      event_manager:emit('message.updated', {
+        info = {
+          id = 'msg-123',
+          sessionID = 'test-session',
+          role = 'assistant',
+        },
+      })
+
+      vim.wait(50, function()
+        return handle.message_id ~= nil
+      end)
+
+      assert.equal('msg-123', handle.message_id)
+
+      event_manager:stop()
+    end)
+
+    it('ignores message.updated for different session', function()
+      local event_manager = EventManager.new()
+      event_manager:start()
+
+      local mock_api_client = {}
+      local callbacks = {
+        on_data = function() end,
+        on_done = function() end,
+        on_error = function() end,
+      }
+
+      local handle = StreamHandle.new('test-session', event_manager, mock_api_client, callbacks)
+
+      -- Simulate message.updated event for different session
+      event_manager:emit('message.updated', {
+        info = {
+          id = 'msg-456',
+          sessionID = 'other-session',
+          role = 'assistant',
+        },
+      })
+
+      vim.wait(50, function()
+        return false -- Just wait a bit
+      end)
+
+      assert.is_nil(handle.message_id)
+
+      event_manager:stop()
+    end)
+
+    it('ignores message.updated for user role', function()
+      local event_manager = EventManager.new()
+      event_manager:start()
+
+      local mock_api_client = {}
+      local callbacks = {
+        on_data = function() end,
+        on_done = function() end,
+        on_error = function() end,
+      }
+
+      local handle = StreamHandle.new('test-session', event_manager, mock_api_client, callbacks)
+
+      -- Simulate message.updated event for user role
+      event_manager:emit('message.updated', {
+        info = {
+          id = 'msg-789',
+          sessionID = 'test-session',
+          role = 'user',
+        },
+      })
+
+      vim.wait(50, function()
+        return false
+      end)
+
+      assert.is_nil(handle.message_id)
+
+      event_manager:stop()
+    end)
+
+    it('calls on_data for text part updates', function()
+      local event_manager = EventManager.new()
+      event_manager:start()
+
+      local mock_api_client = {}
+      local received_chunks = {}
+      local callbacks = {
+        on_data = function(chunk)
+          table.insert(received_chunks, chunk)
+        end,
+        on_done = function() end,
+        on_error = function() end,
+      }
+
+      local handle = StreamHandle.new('test-session', event_manager, mock_api_client, callbacks)
+
+      -- Simulate text part update
+      event_manager:emit('message.part.updated', {
+        part = {
+          id = 'part-1',
+          sessionID = 'test-session',
+          messageID = 'msg-1',
+          type = 'text',
+          text = 'Hello',
+        },
+      })
+
+      vim.wait(100, function()
+        return #received_chunks > 0
+      end)
+
+      assert.equal(1, #received_chunks)
+      assert.equal('text', received_chunks[1].type)
+      assert.equal('Hello', received_chunks[1].text)
+      assert.equal('Hello', handle:get_partial_text())
+
+      event_manager:stop()
+    end)
+
+    it('accumulates text from multiple parts in order', function()
+      local event_manager = EventManager.new()
+      event_manager:start()
+
+      local mock_api_client = {}
+      local callbacks = {
+        on_data = function() end,
+        on_done = function() end,
+        on_error = function() end,
+      }
+
+      local handle = StreamHandle.new('test-session', event_manager, mock_api_client, callbacks)
+
+      -- Simulate multiple text parts
+      event_manager:emit('message.part.updated', {
+        part = {
+          id = 'part-1',
+          sessionID = 'test-session',
+          type = 'text',
+          text = 'First ',
+        },
+      })
+
+      event_manager:emit('message.part.updated', {
+        part = {
+          id = 'part-2',
+          sessionID = 'test-session',
+          type = 'text',
+          text = 'Second',
+        },
+      })
+
+      vim.wait(100, function()
+        return handle:get_partial_text():find('Second') ~= nil
+      end)
+
+      assert.equal('First Second', handle:get_partial_text())
+
+      event_manager:stop()
+    end)
+
+    it('handles incremental text updates to same part', function()
+      local event_manager = EventManager.new()
+      event_manager:start()
+
+      local mock_api_client = {}
+      local received_deltas = {}
+      local callbacks = {
+        on_data = function(chunk)
+          table.insert(received_deltas, chunk.text)
+        end,
+        on_done = function() end,
+        on_error = function() end,
+      }
+
+      local handle = StreamHandle.new('test-session', event_manager, mock_api_client, callbacks)
+
+      -- First update
+      event_manager:emit('message.part.updated', {
+        part = {
+          id = 'part-1',
+          sessionID = 'test-session',
+          type = 'text',
+          text = 'Hello',
+        },
+      })
+
+      -- Incremental update (same part, more text)
+      event_manager:emit('message.part.updated', {
+        part = {
+          id = 'part-1',
+          sessionID = 'test-session',
+          type = 'text',
+          text = 'Hello World',
+        },
+      })
+
+      vim.wait(100, function()
+        return #received_deltas >= 2
+      end)
+
+      -- First delta: 'Hello', second delta: ' World' (the increment)
+      assert.equal('Hello', received_deltas[1])
+      assert.equal(' World', received_deltas[2])
+      assert.equal('Hello World', handle:get_partial_text())
+
+      event_manager:stop()
+    end)
+
+    it('ignores part updates for different session', function()
+      local event_manager = EventManager.new()
+      event_manager:start()
+
+      local mock_api_client = {}
+      local data_called = false
+      local callbacks = {
+        on_data = function()
+          data_called = true
+        end,
+        on_done = function() end,
+        on_error = function() end,
+      }
+
+      local handle = StreamHandle.new('test-session', event_manager, mock_api_client, callbacks)
+
+      -- Part for different session
+      event_manager:emit('message.part.updated', {
+        part = {
+          id = 'part-1',
+          sessionID = 'other-session',
+          type = 'text',
+          text = 'Should not see this',
+        },
+      })
+
+      vim.wait(50, function()
+        return false
+      end)
+
+      assert.is_false(data_called)
+      assert.equal('', handle:get_partial_text())
+
+      event_manager:stop()
+    end)
+
+    it('calls on_tool_call for tool parts', function()
+      local event_manager = EventManager.new()
+      event_manager:start()
+
+      local mock_api_client = {}
+      local received_tool_calls = {}
+      local callbacks = {
+        on_data = function() end,
+        on_tool_call = function(tc)
+          table.insert(received_tool_calls, tc)
+        end,
+        on_done = function() end,
+        on_error = function() end,
+      }
+
+      local handle = StreamHandle.new('test-session', event_manager, mock_api_client, callbacks)
+
+      -- Simulate tool part
+      event_manager:emit('message.part.updated', {
+        part = {
+          id = 'tool-1',
+          sessionID = 'test-session',
+          type = 'tool',
+          tool = 'bash',
+          state = {
+            status = 'running',
+            input = { command = 'ls' },
+          },
+        },
+      })
+
+      vim.wait(100, function()
+        return #received_tool_calls > 0
+      end)
+
+      assert.equal(1, #received_tool_calls)
+      assert.equal('tool-1', received_tool_calls[1].id)
+      assert.equal('bash', received_tool_calls[1].name)
+      assert.equal('running', received_tool_calls[1].status)
+
+      local tool_calls = handle:get_tool_calls()
+      assert.is_not_nil(tool_calls['tool-1'])
+
+      event_manager:stop()
+    end)
+
+    it('completes on session.idle event', function()
+      local event_manager = EventManager.new()
+      event_manager:start()
+
+      local mock_api_client = {
+        get_message = function()
+          return Promise.new():resolve({
+            parts = { { type = 'text', text = 'Final response' } },
+            info = { role = 'assistant' },
+          })
+        end,
+      }
+      local done_called = false
+      local done_message = nil
+      local callbacks = {
+        on_data = function() end,
+        on_done = function(msg)
+          done_called = true
+          done_message = msg
+        end,
+        on_error = function() end,
+      }
+
+      local handle = StreamHandle.new('test-session', event_manager, mock_api_client, callbacks)
+      handle.message_id = 'msg-123' -- Set message_id
+
+      -- Simulate session.idle
+      event_manager:emit('session.idle', { sessionID = 'test-session' })
+
+      vim.wait(100, function()
+        return done_called
+      end)
+
+      assert.is_true(done_called)
+      assert.is_true(handle:is_done())
+      assert.is_not_nil(done_message)
+
+      event_manager:stop()
+    end)
+
+    it('calls on_error on session.error event', function()
+      local event_manager = EventManager.new()
+      event_manager:start()
+
+      local mock_api_client = {}
+      local error_received = nil
+      local callbacks = {
+        on_data = function() end,
+        on_done = function() end,
+        on_error = function(err)
+          error_received = err
+        end,
+      }
+
+      local handle = StreamHandle.new('test-session', event_manager, mock_api_client, callbacks)
+
+      -- Simulate session.error
+      event_manager:emit('session.error', {
+        sessionID = 'test-session',
+        error = 'Something went wrong',
+      })
+
+      vim.wait(100, function()
+        return error_received ~= nil
+      end)
+
+      assert.equal('Something went wrong', error_received)
+      assert.is_true(handle:is_done())
+
+      event_manager:stop()
+    end)
+
+    it('ignores events after completion', function()
+      local event_manager = EventManager.new()
+      event_manager:start()
+
+      local mock_api_client = {
+        get_message = function()
+          return Promise.new():resolve({ parts = {}, info = {} })
+        end,
+      }
+      local data_count = 0
+      local callbacks = {
+        on_data = function()
+          data_count = data_count + 1
+        end,
+        on_done = function() end,
+        on_error = function() end,
+      }
+
+      local handle = StreamHandle.new('test-session', event_manager, mock_api_client, callbacks)
+
+      -- Complete the stream
+      event_manager:emit('session.idle', { sessionID = 'test-session' })
+
+      vim.wait(50, function()
+        return handle:is_done()
+      end)
+
+      -- Try to send more data after completion
+      event_manager:emit('message.part.updated', {
+        part = {
+          id = 'part-late',
+          sessionID = 'test-session',
+          type = 'text',
+          text = 'Late data',
+        },
+      })
+
+      vim.wait(50, function()
+        return false
+      end)
+
+      -- Should not have received late data
+      assert.equal(0, data_count)
+
+      event_manager:stop()
+    end)
+  end)
+
+  describe('permission handling', function()
+    it('calls on_permission callback for permission.updated event', function()
+      local event_manager = EventManager.new()
+      event_manager:start()
+
+      local mock_api_client = {
+        respond_to_permission = function()
+          return Promise.new():resolve(true)
+        end,
+      }
+      local permission_received = nil
+      local callbacks = {
+        on_data = function() end,
+        on_permission = function(perm)
+          permission_received = perm
+          return 'once'
+        end,
+        on_done = function() end,
+        on_error = function() end,
+      }
+
+      local handle = StreamHandle.new('test-session', event_manager, mock_api_client, callbacks)
+
+      -- Simulate permission.updated
+      event_manager:emit('permission.updated', {
+        id = 'perm-123',
+        sessionID = 'test-session',
+        messageID = 'msg-1',
+        type = 'bash',
+        title = 'Run bash command',
+        pattern = { command = 'ls' },
+      })
+
+      vim.wait(100, function()
+        return permission_received ~= nil
+      end)
+
+      assert.is_not_nil(permission_received)
+      assert.equal('perm-123', permission_received.id)
+      assert.equal('bash', permission_received.tool_name)
+
+      event_manager:stop()
+    end)
+
+    it('uses permission_handler when provided', function()
+      local event_manager = EventManager.new()
+      event_manager:start()
+
+      local respond_called = false
+      local respond_args = nil
+      local mock_api_client = {
+        respond_to_permission = function(self, session_id, perm_id, opts)
+          respond_called = true
+          respond_args = { session_id = session_id, perm_id = perm_id, opts = opts }
+          return Promise.new():resolve(true)
+        end,
+      }
+      local callbacks = {
+        on_data = function() end,
+        on_done = function() end,
+        on_error = function() end,
+      }
+
+      local permission_handler = require('opencode.headless.permission_handler')
+      local handler = permission_handler.auto_approve()
+
+      local handle = StreamHandle.new('test-session', event_manager, mock_api_client, callbacks, handler)
+
+      -- Simulate permission.updated
+      event_manager:emit('permission.updated', {
+        id = 'perm-456',
+        sessionID = 'test-session',
+        type = 'read',
+        title = 'Read file',
+      })
+
+      vim.wait(100, function()
+        return respond_called
+      end)
+
+      assert.is_true(respond_called)
+      assert.equal('test-session', respond_args.session_id)
+      assert.equal('perm-456', respond_args.perm_id)
+      assert.equal('allow', respond_args.opts.approval) -- 'once' maps to 'allow'
+
+      event_manager:stop()
+    end)
+
+    it('rejects permission when no handler and no callback', function()
+      local event_manager = EventManager.new()
+      event_manager:start()
+
+      local respond_called = false
+      local respond_approval = nil
+      local mock_api_client = {
+        respond_to_permission = function(self, session_id, perm_id, opts)
+          respond_called = true
+          respond_approval = opts.approval
+          return Promise.new():resolve(true)
+        end,
+      }
+      local callbacks = {
+        on_data = function() end,
+        on_done = function() end,
+        on_error = function() end,
+        -- No on_permission callback
+      }
+
+      local handle = StreamHandle.new('test-session', event_manager, mock_api_client, callbacks)
+
+      -- Simulate permission.updated
+      event_manager:emit('permission.updated', {
+        id = 'perm-789',
+        sessionID = 'test-session',
+        type = 'bash',
+        title = 'Run command',
+      })
+
+      vim.wait(100, function()
+        return respond_called
+      end)
+
+      assert.is_true(respond_called)
+      assert.equal('deny', respond_approval) -- No handler defaults to reject/deny
+
+      event_manager:stop()
+    end)
+
+    it('handles async permission callback returning Promise', function()
+      local event_manager = EventManager.new()
+      event_manager:start()
+
+      local respond_called = false
+      local respond_approval = nil
+      local mock_api_client = {
+        respond_to_permission = function(self, session_id, perm_id, opts)
+          respond_called = true
+          respond_approval = opts.approval
+          return Promise.new():resolve(true)
+        end,
+      }
+      local callbacks = {
+        on_data = function() end,
+        on_permission = function(perm)
+          -- Return a Promise
+          local p = Promise.new()
+          vim.defer_fn(function()
+            p:resolve('always')
+          end, 10)
+          return p
+        end,
+        on_done = function() end,
+        on_error = function() end,
+      }
+
+      local handle = StreamHandle.new('test-session', event_manager, mock_api_client, callbacks)
+
+      event_manager:emit('permission.updated', {
+        id = 'perm-async',
+        sessionID = 'test-session',
+        type = 'edit',
+        title = 'Edit file',
+      })
+
+      vim.wait(200, function()
+        return respond_called
+      end)
+
+      assert.is_true(respond_called)
+      assert.equal('always', respond_approval)
+
+      event_manager:stop()
+    end)
+
+    it('handles permission callback error gracefully', function()
+      local event_manager = EventManager.new()
+      event_manager:start()
+
+      local respond_called = false
+      local respond_approval = nil
+      local mock_api_client = {
+        respond_to_permission = function(self, session_id, perm_id, opts)
+          respond_called = true
+          respond_approval = opts.approval
+          return Promise.new():resolve(true)
+        end,
+      }
+      local callbacks = {
+        on_data = function() end,
+        on_permission = function(perm)
+          error('Callback error!')
+        end,
+        on_done = function() end,
+        on_error = function() end,
+      }
+
+      local handle = StreamHandle.new('test-session', event_manager, mock_api_client, callbacks)
+
+      event_manager:emit('permission.updated', {
+        id = 'perm-error',
+        sessionID = 'test-session',
+        type = 'bash',
+        title = 'Run command',
+      })
+
+      vim.wait(100, function()
+        return respond_called
+      end)
+
+      assert.is_true(respond_called)
+      assert.equal('deny', respond_approval) -- Error defaults to reject/deny
+
+      event_manager:stop()
+    end)
+
+    it('removes pending permission on permission.replied', function()
+      local event_manager = EventManager.new()
+      event_manager:start()
+
+      local mock_api_client = {
+        respond_to_permission = function()
+          return Promise.new():resolve(true)
+        end,
+      }
+      local callbacks = {
+        on_data = function() end,
+        on_permission = function()
+          return 'once'
+        end,
+        on_done = function() end,
+        on_error = function() end,
+      }
+
+      local handle = StreamHandle.new('test-session', event_manager, mock_api_client, callbacks)
+
+      -- First, permission requested
+      event_manager:emit('permission.updated', {
+        id = 'perm-pending',
+        sessionID = 'test-session',
+        type = 'bash',
+        title = 'Command',
+      })
+
+      vim.wait(50, function()
+        return handle.pending_permissions['perm-pending'] ~= nil
+      end)
+
+      -- Check it's pending
+      assert.is_true(handle.pending_permissions['perm-pending'] or false)
+
+      -- Permission replied
+      event_manager:emit('permission.replied', {
+        sessionID = 'test-session',
+        permissionID = 'perm-pending',
+        response = 'allow',
+      })
+
+      vim.wait(50, function()
+        return handle.pending_permissions['perm-pending'] == nil
+      end)
+
+      assert.is_nil(handle.pending_permissions['perm-pending'])
+
+      event_manager:stop()
     end)
   end)
 end)
@@ -1354,5 +2342,84 @@ describe('opencode.headless batch operations', function()
         assert.is_function(result.and_then)
       end
     end)
+  end)
+end)
+
+describe('opencode.headless.permission_handler special characters', function()
+  local permission_handler = require('opencode.headless.permission_handler')
+
+  it('escapes Lua special characters in patterns', function()
+    -- Test patterns with special chars like . which is special in Lua regex
+    assert.is_true(permission_handler.match_pattern('file.read', 'file.read'))
+    assert.is_false(permission_handler.match_pattern('fileXread', 'file.read')) -- . should not match X
+
+    -- Test with other special chars
+    assert.is_true(permission_handler.match_pattern('foo(bar)', 'foo(bar)'))
+    assert.is_false(permission_handler.match_pattern('foobar', 'foo(bar)'))
+
+    -- Test % char
+    assert.is_true(permission_handler.match_pattern('100%', '100%'))
+
+    -- Test + char
+    assert.is_true(permission_handler.match_pattern('a+b', 'a+b'))
+    assert.is_false(permission_handler.match_pattern('aaaaab', 'a+b')) -- + should not repeat 'a'
+
+    -- Test - char
+    assert.is_true(permission_handler.match_pattern('a-b', 'a-b'))
+
+    -- Test ? char
+    assert.is_true(permission_handler.match_pattern('maybe?', 'maybe?'))
+    assert.is_false(permission_handler.match_pattern('mayb', 'maybe?')) -- ? should not make 'e' optional
+
+    -- Test [] chars
+    assert.is_true(permission_handler.match_pattern('[test]', '[test]'))
+    assert.is_false(permission_handler.match_pattern('t', '[test]')) -- [] should not be char class
+
+    -- Test ^ and $ chars
+    assert.is_true(permission_handler.match_pattern('^start$', '^start$'))
+  end)
+
+  it('still supports * wildcard after escaping', function()
+    -- * should still work as wildcard
+    assert.is_true(permission_handler.match_pattern('file.read', 'file.*'))
+    assert.is_true(permission_handler.match_pattern('foo(bar)', 'foo*'))
+    assert.is_true(permission_handler.match_pattern('test.something.here', '*something*'))
+  end)
+end)
+
+describe('opencode.headless.context immutability', function()
+  local headless_context = require('opencode.headless.context')
+
+  it('normalize_file does not mutate input object', function()
+    local input = { path = '/path/to/file.lua' }
+    local original_keys = vim.tbl_count(input)
+
+    local result = headless_context.normalize_file(input)
+
+    -- Original should not be mutated
+    assert.equal(original_keys, vim.tbl_count(input))
+    assert.is_nil(input.name)
+    assert.is_nil(input.extension)
+
+    -- Result should have all fields
+    assert.equal('/path/to/file.lua', result.path)
+    assert.equal('file.lua', result.name)
+    assert.equal('lua', result.extension)
+
+    -- Result should be a different object
+    assert.is_not_equal(input, result)
+  end)
+
+  it('normalize_selection does not mutate input selection', function()
+    local input = { content = 'local x = 1', lines = '1, 1' }
+    local original_keys = vim.tbl_count(input)
+
+    local result = headless_context.normalize_selection(input)
+
+    -- Original should not be mutated
+    assert.equal(original_keys, vim.tbl_count(input))
+
+    -- Result should have content
+    assert.equal('local x = 1', result.content)
   end)
 end)

@@ -53,15 +53,14 @@ function M.normalize_file(file)
     }
   end
 
-  -- Already HeadlessFileInfo, fill in missing fields
+  -- Already HeadlessFileInfo, create a new object with filled in fields
+  -- Don't mutate the input object
   local path = file.path
-  if not file.name then
-    file.name = vim.fn.fnamemodify(path, ':t')
-  end
-  if not file.extension then
-    file.extension = vim.fn.fnamemodify(path, ':e')
-  end
-  return file
+  return {
+    path = path,
+    name = file.name or vim.fn.fnamemodify(path, ':t'),
+    extension = file.extension or vim.fn.fnamemodify(path, ':e'),
+  }
 end
 
 ---Normalize a selection input
