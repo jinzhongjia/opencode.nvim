@@ -429,8 +429,11 @@ function OpencodeHeadless:chat_stream(message, opts)
     get_partial_text = function()
       return ''
     end,
+    get_tool_calls = function()
+      return {}
+    end,
   }
-  
+
   -- Replace with real handle once created
   session_promise:and_then(function()
     if stream_handle then
@@ -442,6 +445,9 @@ function OpencodeHeadless:chat_stream(message, opts)
       end
       dummy_handle.get_partial_text = function()
         return stream_handle:get_partial_text()
+      end
+      dummy_handle.get_tool_calls = function()
+        return stream_handle:get_tool_calls()
       end
     end
   end)

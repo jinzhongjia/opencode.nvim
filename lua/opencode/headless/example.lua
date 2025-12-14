@@ -133,6 +133,250 @@ local function example_streaming()
   end)
 end
 
+---Example 6: Tool calls with auto-approval
+local function example_tool_calls_auto()
+  local headless = require('opencode.headless')
+  local permission_handler = require('opencode.headless.permission_handler')
+
+  headless.new():and_then(function(client)
+    print('Starting chat with tool calls (auto-approve)...')
+
+    local tool_call_count = 0
+    local handle = client:chat_stream('Read the contents of README.md', {
+      -- Auto-approve all tool calls
+      permission_handler = permission_handler.auto_approve(),
+
+      on_data = function(chunk)
+        if chunk.text then
+          io.write(chunk.text)
+          io.flush()
+        end
+      end,
+
+      on_tool_call = function(tool_call)
+        tool_call_count = tool_call_count + 1
+        print(string.format(
+          '\n[Tool Call #%d] %s: %s',
+          tool_call_count,
+          tool_call.name,
+          tool_call.status
+        ))
+        if tool_call.status == 'completed' and tool_call.output then
+          print(string.format('  Output: %s...', tool_call.output:sub(1, 50)))
+        end
+      end,
+
+      on_done = function(message)
+        print('\n\n=== Done ===')
+        print('Tool calls:', tool_call_count)
+        local all_tool_calls = handle:get_tool_calls()
+        print('Tracked tool calls:', vim.tbl_count(all_tool_calls))
+        client:close()
+      end,
+
+      on_error = function(err)
+        print('\nError:', vim.inspect(err))
+        client:close()
+      end,
+    })
+
+    print('Stream handle created')
+  end):catch(function(err)
+    print('Failed to create client:', vim.inspect(err))
+  end)
+end
+
+---Example 7: Tool calls with safe defaults (auto-approve read, ask for write)
+local function example_tool_calls_safe()
+  local headless = require('opencode.headless')
+  local permission_handler = require('opencode.headless.permission_handler')
+
+  headless.new():and_then(function(client)
+    print('Starting chat with tool calls (safe defaults)...')
+
+    local _ = client:chat_stream('List files in the current directory', {
+      -- Use safe defaults: read operations auto-approved, write operations need approval
+      permission_handler = permission_handler.safe_defaults(),
+
+      on_data = function(chunk)
+        if chunk.text then
+          io.write(chunk.text)
+          io.flush()
+        end
+      end,
+
+      on_tool_call = function(tool_call)
+        print(string.format('\n[%s] %s', tool_call.name, tool_call.status))
+      end,
+
+      on_done = function()
+        print('\n\n=== Done ===')
+        client:close()
+      end,
+
+      on_error = function(err)
+        print('\nError:', vim.inspect(err))
+        client:close()
+      end,
+    })
+
+    print('Stream handle created')
+    print('Note: read/glob/grep/list will be auto-approved')
+    print('Note: bash/edit/write will be approved once per call')
+    print('Note: unknown tools will be rejected')
+  end):catch(function(err)
+    print('Failed to create client:', vim.inspect(err))
+  end)
+end
+
+---Example 8: Tool calls with custom permission callback
+local function example_tool_calls_custom()
+  local headless = require('opencode.headless')
+  local Promise = require('opencode.promise')
+
+  headless.new():and_then(function(client)
+    print('Starting chat with tool calls (custom callback)...')
+
+    local _ = client:chat_stream('Create a file called test.txt with hello world', {
+      on_data = function(chunk)
+        if chunk.text then
+          io.write(chunk.text)
+          io.flush()
+        end
+      end,
+
+      -- Custom permission callback
+      on_permission = function(permission)
+        print(string.format(
+          '\n[Permission Request] Tool: %s, Title: %s',
+          permission.tool_name,
+          permission.title
+        ))
+
+        -- Example: simulate async user confirmation
+        -- In a real scenario, you might show a UI prompt
+        local promise = Promise.new()
+
+        vim.defer_fn(function()
+          -- Approve all read operations, reject write operations
+          if permission.tool_name == 'read' or permission.tool_name == 'glob' then
+            print('  -> Auto-approved (read operation)')
+            promise:resolve('always')
+          elseif permission.tool_name == 'write' then
+            print('  -> Rejected (write operation)')
+            promise:resolve('reject')
+          else
+            print('  -> Approved once')
+            promise:resolve('once')
+          end
+        end, 100) -- Simulate 100ms delay
+
+        return promise
+      end,
+
+      on_tool_call = function(tool_call)
+        print(string.format('\n[Tool] %s: %s', tool_call.name, tool_call.status))
+      end,
+
+      on_done = function()
+        print('\n\n=== Done ===')
+        client:close()
+      end,
+
+      on_error = function(err)
+        print('\nError:', vim.inspect(err))
+        client:close()
+      end,
+    })
+
+    print('Stream handle created')
+  end):catch(function(err)
+    print('Failed to create client:', vim.inspect(err))
+  end)
+end
+
+---Example 9: Tool calls with rule-based permissions
+local function example_tool_calls_rules()
+  local headless = require('opencode.headless')
+  local permission_handler = require('opencode.headless.permission_handler')
+
+  -- Create a custom permission handler with specific rules
+  local handler = permission_handler.new({
+    strategy = 'auto_reject', -- Default: reject unknown tools
+    rules = {
+      -- Always allow read operations
+      { pattern = 'read', action = 'always' },
+      { pattern = 'glob', action = 'always' },
+      { pattern = 'grep', action = 'always' },
+      { pattern = 'list', action = 'always' },
+
+      -- Allow bash commands that start with 'echo' or 'cat'
+      {
+        pattern = 'bash',
+        action = 'once',
+        condition = function(perm)
+          local input = perm.pattern or {}
+          local command = input.command or ''
+          return command:match('^echo') or command:match('^cat')
+        end,
+      },
+
+      -- Reject all other bash commands
+      { pattern = 'bash', action = 'reject' },
+
+      -- Allow editing files in /tmp only
+      {
+        pattern = 'edit',
+        action = 'once',
+        condition = function(perm)
+          local input = perm.pattern or {}
+          local file_path = input.filePath or ''
+          return file_path:match('^/tmp/')
+        end,
+      },
+    },
+  })
+
+  headless.new():and_then(function(client)
+    print('Starting chat with rule-based permissions...')
+
+    local _ = client:chat_stream('Run echo hello and then try to delete a file', {
+      permission_handler = handler,
+
+      on_data = function(chunk)
+        if chunk.text then
+          io.write(chunk.text)
+          io.flush()
+        end
+      end,
+
+      on_tool_call = function(tool_call)
+        print(string.format('\n[%s] %s', tool_call.name, tool_call.status))
+      end,
+
+      on_done = function()
+        print('\n\n=== Done ===')
+        client:close()
+      end,
+
+      on_error = function(err)
+        print('\nError:', vim.inspect(err))
+        client:close()
+      end,
+    })
+
+    print('Stream handle created')
+    print('Rules:')
+    print('  - read/glob/grep/list: always allowed')
+    print('  - bash (echo/cat): allowed once per call')
+    print('  - bash (other): rejected')
+    print('  - edit (/tmp/*): allowed once')
+    print('  - edit (other): rejected')
+  end):catch(function(err)
+    print('Failed to create client:', vim.inspect(err))
+  end)
+end
+
 -- Return examples for manual testing
 return {
   simple_chat = example_simple_chat,
@@ -140,4 +384,8 @@ return {
   with_options = example_with_options,
   with_spawn = example_with_spawn,
   streaming = example_streaming,
+  tool_calls_auto = example_tool_calls_auto,
+  tool_calls_safe = example_tool_calls_safe,
+  tool_calls_custom = example_tool_calls_custom,
+  tool_calls_rules = example_tool_calls_rules,
 }
