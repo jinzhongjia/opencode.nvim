@@ -1070,3 +1070,289 @@ describe('opencode.headless.context', function()
     end)
   end)
 end)
+
+describe('opencode.headless.retry', function()
+  local retry = require('opencode.headless.retry')
+
+  describe('is_retryable', function()
+    it('returns false for nil error', function()
+      assert.is_false(retry.is_retryable(nil, { 'timeout' }))
+    end)
+
+    it('matches string errors', function()
+      assert.is_true(retry.is_retryable('connection timeout', { 'timeout' }))
+      assert.is_true(retry.is_retryable('rate_limit exceeded', { 'rate_limit' }))
+      assert.is_false(retry.is_retryable('unknown error', { 'timeout' }))
+    end)
+
+    it('matches case-insensitively', function()
+      assert.is_true(retry.is_retryable('TIMEOUT error', { 'timeout' }))
+      assert.is_true(retry.is_retryable('Timeout Error', { 'TIMEOUT' }))
+    end)
+
+    it('matches table errors via inspect', function()
+      local err = { code = 'ETIMEDOUT', message = 'connection failed' }
+      assert.is_true(retry.is_retryable(err, { 'ETIMEDOUT' }))
+    end)
+  end)
+
+  describe('calculate_delay', function()
+    it('calculates exponential backoff', function()
+      local config = { delay_ms = 1000, backoff = 'exponential', max_delay_ms = 30000 }
+      local delay1 = retry.calculate_delay(1, config)
+      local delay2 = retry.calculate_delay(2, config)
+      local delay3 = retry.calculate_delay(3, config)
+
+      -- With jitter, roughly: 1000, 2000, 4000
+      assert.is_true(delay1 >= 900 and delay1 <= 1100)
+      assert.is_true(delay2 >= 1800 and delay2 <= 2200)
+      assert.is_true(delay3 >= 3600 and delay3 <= 4400)
+    end)
+
+    it('calculates linear backoff', function()
+      local config = { delay_ms = 1000, backoff = 'linear', max_delay_ms = 30000 }
+      local delay1 = retry.calculate_delay(1, config)
+      local delay2 = retry.calculate_delay(2, config)
+      local delay3 = retry.calculate_delay(3, config)
+
+      -- With jitter, roughly: 1000, 2000, 3000
+      assert.is_true(delay1 >= 900 and delay1 <= 1100)
+      assert.is_true(delay2 >= 1800 and delay2 <= 2200)
+      assert.is_true(delay3 >= 2700 and delay3 <= 3300)
+    end)
+
+    it('caps at max_delay_ms', function()
+      local config = { delay_ms = 10000, backoff = 'exponential', max_delay_ms = 5000 }
+      local delay = retry.calculate_delay(5, config)
+      assert.is_true(delay <= 5000)
+    end)
+  end)
+
+  describe('with_retry', function()
+    it('returns result on success', function()
+      local result
+      local fn = function()
+        return Promise.new():resolve('success')
+      end
+
+      retry.with_retry(fn):and_then(function(r)
+        result = r
+      end)
+
+      vim.wait(50, function()
+        return result ~= nil
+      end)
+
+      assert.equal('success', result)
+    end)
+
+    it('retries on retryable error', function()
+      local attempts = 0
+      local result
+
+      local fn = function()
+        attempts = attempts + 1
+        if attempts < 2 then
+          return Promise.new():reject('timeout error')
+        end
+        return Promise.new():resolve('success after retry')
+      end
+
+      retry.with_retry(fn, { delay_ms = 10 }):and_then(function(r)
+        result = r
+      end)
+
+      vim.wait(200, function()
+        return result ~= nil
+      end)
+
+      assert.equal(2, attempts)
+      assert.equal('success after retry', result)
+    end)
+
+    it('does not retry on non-retryable error', function()
+      local attempts = 0
+      local error_result
+
+      local fn = function()
+        attempts = attempts + 1
+        return Promise.new():reject('some random error')
+      end
+
+      retry.with_retry(fn, { retryable_errors = { 'timeout' } }):catch(function(err)
+        error_result = err
+      end)
+
+      vim.wait(100, function()
+        return error_result ~= nil
+      end)
+
+      assert.equal(1, attempts)
+      assert.is_not_nil(error_result)
+    end)
+
+    it('respects max_attempts', function()
+      local attempts = 0
+      local error_result
+
+      local fn = function()
+        attempts = attempts + 1
+        return Promise.new():reject('timeout')
+      end
+
+      retry.with_retry(fn, { max_attempts = 3, delay_ms = 10 }):catch(function(err)
+        error_result = err
+      end)
+
+      vim.wait(300, function()
+        return error_result ~= nil
+      end)
+
+      assert.equal(3, attempts)
+      assert.is_not_nil(error_result)
+    end)
+
+    it('calls on_retry callback', function()
+      local retry_calls = {}
+      local fn = function()
+        return Promise.new():reject('timeout')
+      end
+
+      retry.with_retry(fn, {
+        max_attempts = 2,
+        delay_ms = 10,
+        on_retry = function(attempt, err, delay)
+          table.insert(retry_calls, { attempt = attempt, err = err, delay = delay })
+        end,
+      }):catch(function() end)
+
+      vim.wait(200, function()
+        return #retry_calls >= 1
+      end)
+
+      assert.equal(1, #retry_calls)
+      assert.equal(1, retry_calls[1].attempt)
+    end)
+  end)
+
+  describe('create_wrapper', function()
+    it('creates a reusable retry wrapper', function()
+      local wrapper = retry.create_wrapper({ max_attempts = 2, delay_ms = 10 })
+      local result
+
+      local fn = function()
+        return Promise.new():resolve('wrapped result')
+      end
+
+      wrapper(fn):and_then(function(r)
+        result = r
+      end)
+
+      vim.wait(50, function()
+        return result ~= nil
+      end)
+
+      assert.equal('wrapped result', result)
+    end)
+  end)
+end)
+
+describe('opencode.headless batch operations', function()
+  local original_ensure_server
+  local original_api_client_create
+  local mock_api_client
+
+  before_each(function()
+    local server_job = require('opencode.server_job')
+    local api_client_module = require('opencode.api_client')
+    original_ensure_server = server_job.ensure_server
+    original_api_client_create = api_client_module.create
+
+    server_job.ensure_server = function()
+      local p = Promise.new()
+      p:resolve(true)
+      return p
+    end
+
+    mock_api_client = {
+      create_session = function()
+        local p = Promise.new()
+        p:resolve({ id = 'batch-session-' .. math.random(1000, 9999) })
+        return p
+      end,
+      abort_session = function()
+        return Promise.new():resolve(true)
+      end,
+    }
+
+    api_client_module.create = function()
+      return mock_api_client
+    end
+  end)
+
+  after_each(function()
+    local server_job = require('opencode.server_job')
+    local api_client_module = require('opencode.api_client')
+    if original_ensure_server then
+      server_job.ensure_server = original_ensure_server
+    end
+    if original_api_client_create then
+      api_client_module.create = original_api_client_create
+    end
+  end)
+
+  describe('batch', function()
+    it('returns a Promise', function()
+      local instance
+      headless.new():and_then(function(inst)
+        instance = inst
+      end)
+
+      vim.wait(100, function()
+        return instance ~= nil
+      end)
+
+      if instance then
+        local result = instance:batch({})
+        assert.is_table(result)
+        assert.is_function(result.and_then)
+      end
+    end)
+
+    it('returns empty array for empty requests', function()
+      local instance, results
+      headless.new():and_then(function(inst)
+        instance = inst
+        return instance:batch({})
+      end):and_then(function(r)
+        results = r
+      end)
+
+      vim.wait(100, function()
+        return results ~= nil
+      end)
+
+      assert.is_table(results)
+      assert.equal(0, #results)
+    end)
+  end)
+
+  describe('map', function()
+    it('returns a Promise', function()
+      local instance
+      headless.new():and_then(function(inst)
+        instance = inst
+      end)
+
+      vim.wait(100, function()
+        return instance ~= nil
+      end)
+
+      if instance then
+        local result = instance:map({}, function() return { message = 'test' } end)
+        assert.is_table(result)
+        assert.is_function(result.and_then)
+      end
+    end)
+  end)
+end)

@@ -3,6 +3,23 @@ local api_client_module = require('opencode.api_client')
 local EventManager = require('opencode.event_manager')
 local session_utils = require('opencode.session')
 local server_job = require('opencode.server_job')
+local retry_module = require('opencode.headless.retry')
+
+---@class RetryConfig
+---@field max_attempts? number Maximum number of retry attempts (default: 3)
+---@field delay_ms? number Initial delay between retries in ms (default: 1000)
+---@field backoff? 'linear'|'exponential' Backoff strategy (default: 'exponential')
+---@field max_delay_ms? number Maximum delay between retries (default: 30000)
+---@field retryable_errors? string[] Error patterns that trigger retry
+---@field on_retry? fun(attempt: number, error: any, delay: number): nil
+
+---@class OpencodeHeadlessConfig
+---@field model? string Default model (e.g., 'anthropic/claude-3-5-sonnet-20241022')
+---@field agent? string Default agent (e.g., 'plan', 'build')
+---@field auto_start_server? boolean Whether to auto-start server (default: true)
+---@field directory? string Working directory (default: cwd)
+---@field timeout? number Timeout in milliseconds (default: 120000)
+---@field retry? RetryConfig|boolean Retry configuration (true for defaults, false to disable)
 
 ---@class OpencodeHeadless
 ---@field private config OpencodeHeadlessConfig
@@ -10,6 +27,7 @@ local server_job = require('opencode.server_job')
 ---@field private event_manager EventManager
 ---@field private active_sessions table<string, Session>
 ---@field private server OpencodeServer|nil
+---@field private retry_config RetryConfig|nil
 local OpencodeHeadless = {}
 OpencodeHeadless.__index = OpencodeHeadless
 
@@ -26,7 +44,16 @@ function OpencodeHeadless.new(opts)
     auto_start_server = opts.auto_start_server ~= false, -- default true
     directory = opts.directory or vim.fn.getcwd(),
     timeout = opts.timeout or 120000, -- 2 minutes default
+    retry = opts.retry,
   }
+
+  -- Normalize retry config
+  local retry_config = nil
+  if config.retry == true then
+    retry_config = {} -- use defaults
+  elseif type(config.retry) == 'table' then
+    retry_config = config.retry
+  end
 
   local promise = Promise.new()
 
@@ -53,6 +80,7 @@ function OpencodeHeadless.new(opts)
         event_manager = event_manager,
         active_sessions = {}, -- Track sessions we're using
         server = server,
+        retry_config = retry_config,
       }, OpencodeHeadless)
 
       promise:resolve(instance)
@@ -164,29 +192,66 @@ function OpencodeHeadless:send_message(session_id, message, opts)
     message_data.agent = agent
   end
 
-  -- Send the message and wait for response
-  return self:_send_and_wait_for_response(session_id, message_data)
+  -- Send the message and wait for response (with optional retry)
+  local send_fn = function()
+    return self:_send_and_wait_for_response(session_id, message_data, opts.timeout)
+  end
+
+  if self.retry_config then
+    return retry_module.with_retry(send_fn, self.retry_config)
+  end
+
+  return send_fn()
 end
 
 ---Internal: Send message and wait for response
 ---@param session_id string
 ---@param message_data table
+---@param timeout? number Optional timeout override
 ---@return Promise<ChatResponse>
-function OpencodeHeadless:_send_and_wait_for_response(session_id, message_data)
+function OpencodeHeadless:_send_and_wait_for_response(session_id, message_data, timeout)
   local promise = Promise.new()
   local assistant_message_id = nil
+  local is_completed = false
+  local timeout_timer = nil
 
   -- Forward declare handlers to avoid undefined references
   local on_message_updated, on_session_idle, on_session_error
 
+  -- Cleanup function
+  local function cleanup()
+    if is_completed then
+      return
+    end
+    is_completed = true
+
+    -- Cancel timeout timer
+    if timeout_timer then
+      vim.fn.timer_stop(timeout_timer)
+      timeout_timer = nil
+    end
+
+    -- Unsubscribe from events
+    self.event_manager:unsubscribe('message.updated', on_message_updated)
+    self.event_manager:unsubscribe('session.idle', on_session_idle)
+    self.event_manager:unsubscribe('session.error', on_session_error)
+  end
+
+  -- Setup timeout
+  local timeout_ms = timeout or self.config.timeout
+  if timeout_ms and timeout_ms > 0 then
+    timeout_timer = vim.fn.timer_start(timeout_ms, function()
+      if not is_completed then
+        cleanup()
+        promise:reject('Request timed out after ' .. timeout_ms .. 'ms')
+      end
+    end)
+  end
+
   -- Define error handler
   on_session_error = function(data)
     if data.sessionID == session_id then
-      -- Unsubscribe from events
-      self.event_manager:unsubscribe('message.updated', on_message_updated)
-      self.event_manager:unsubscribe('session.idle', on_session_idle)
-      self.event_manager:unsubscribe('session.error', on_session_error)
-
+      cleanup()
       promise:reject(data.error)
     end
   end
@@ -202,10 +267,7 @@ function OpencodeHeadless:_send_and_wait_for_response(session_id, message_data)
   -- Listen for session idle (means response is complete)
   on_session_idle = function(data)
     if data.sessionID == session_id then
-      -- Unsubscribe from events
-      self.event_manager:unsubscribe('message.updated', on_message_updated)
-      self.event_manager:unsubscribe('session.idle', on_session_idle)
-      self.event_manager:unsubscribe('session.error', on_session_error)
+      cleanup()
 
       if assistant_message_id then
         -- Fetch the complete message with parts
@@ -452,6 +514,91 @@ function OpencodeHeadless:close()
 
   -- Note: We don't shutdown the server here as it might be used by other clients
   -- If you want to shutdown the server, call server:shutdown() explicitly
+end
+
+---@class BatchRequest
+---@field message string The message to send
+---@field context? HeadlessContext Context for this request
+---@field contexts? HeadlessContext[] Multiple contexts
+---@field model? string Override model
+---@field agent? string Override agent
+
+---@class BatchResult
+---@field success boolean Whether the request succeeded
+---@field response? ChatResponse The response (if success)
+---@field error? any The error (if failed)
+---@field index number Original index in the batch
+
+---Execute multiple chat requests in parallel
+---@param requests BatchRequest[] Array of chat requests
+---@param opts? { max_concurrent?: number } Batch options
+---@return Promise<BatchResult[]>
+function OpencodeHeadless:batch(requests, opts)
+  opts = opts or {}
+  local max_concurrent = opts.max_concurrent or 5
+
+  -- Create promises for all requests
+  local results = {}
+  for i = 1, #requests do
+    results[i] = { success = false, index = i }
+  end
+
+  -- Process in batches
+  local function process_batch(start_idx)
+    local batch_promises = {}
+    local end_idx = math.min(start_idx + max_concurrent - 1, #requests)
+
+    for i = start_idx, end_idx do
+      local req = requests[i]
+      local idx = i
+
+      local request_promise = self:chat(req.message, {
+        context = req.context,
+        contexts = req.contexts,
+        model = req.model,
+        agent = req.agent,
+      })
+        :and_then(function(response)
+          results[idx] = { success = true, response = response, index = idx }
+          return results[idx]
+        end)
+        :catch(function(err)
+          results[idx] = { success = false, error = err, index = idx }
+          return results[idx]
+        end)
+
+      table.insert(batch_promises, request_promise)
+    end
+
+    -- Wait for this batch to complete
+    return Promise.all(batch_promises):and_then(function()
+      -- Process next batch if there are more requests
+      if end_idx < #requests then
+        return process_batch(end_idx + 1)
+      end
+      return results
+    end)
+  end
+
+  if #requests == 0 then
+    return Promise.new():resolve(results)
+  end
+
+  return process_batch(1)
+end
+
+---Map a function over items and execute in parallel
+---@generic T
+---@param items T[] Array of items to process
+---@param fn fun(item: T, index: number): BatchRequest Function to create request from item
+---@param opts? { max_concurrent?: number } Batch options
+---@return Promise<BatchResult[]>
+function OpencodeHeadless:map(items, fn, opts)
+  local requests = {}
+  for i, item in ipairs(items) do
+    requests[i] = fn(item, i)
+  end
+  return self:batch(requests, opts)
 end
 
 return {

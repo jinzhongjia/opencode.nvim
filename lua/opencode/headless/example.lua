@@ -617,6 +617,139 @@ local function example_image_streaming()
   end)
 end
 
+---Example 16: Chat with retry configuration
+local function example_with_retry()
+  local headless = require('opencode.headless')
+
+  headless.new({
+    retry = {
+      max_attempts = 3,
+      delay_ms = 1000,
+      backoff = 'exponential',
+      jitter = true,
+      on_retry = function(attempt, err, delay)
+        print(string.format('[Retry] Attempt %d failed: %s. Retrying in %dms...', attempt, tostring(err), delay))
+      end,
+    },
+  }):and_then(function(client)
+    print('Client created with retry config')
+    print('Retry settings: max_attempts=3, backoff=exponential')
+
+    return client:chat('What is Neovim?'):and_then(function(response)
+      print('\n=== Response ===')
+      print(response.text:sub(1, 200))
+      client:close()
+    end)
+  end):catch(function(err)
+    print('Error:', vim.inspect(err))
+  end)
+end
+
+---Example 17: Chat with timeout
+local function example_with_timeout()
+  local headless = require('opencode.headless')
+
+  headless.new({
+    timeout = 30000, -- 30 second global timeout
+  }):and_then(function(client)
+    print('Client created with 30s timeout')
+
+    -- Can also override timeout per-request
+    return client:chat('Write a haiku about programming', {
+      timeout = 10000, -- 10 second timeout for this request
+    }):and_then(function(response)
+      print('\n=== Response ===')
+      print(response.text)
+      client:close()
+    end)
+  end):catch(function(err)
+    if tostring(err):match('timeout') then
+      print('Request timed out!')
+    else
+      print('Error:', vim.inspect(err))
+    end
+  end)
+end
+
+---Example 18: Batch requests
+local function example_batch_requests()
+  local headless = require('opencode.headless')
+  local Promise = require('opencode.promise')
+
+  Promise.spawn(function()
+    local client = headless.new():await()
+    print('Starting batch requests...')
+
+    -- Execute multiple requests in parallel
+    local results = client:batch({
+      { message = 'What is Lua?' },
+      { message = 'What is Neovim?' },
+      { message = 'What is Vim?' },
+    }, {
+      max_concurrent = 2, -- Limit to 2 concurrent requests
+    }):await()
+
+    print('\n=== Batch Results ===')
+    for i, result in ipairs(results) do
+      if result.success then
+        print(string.format('[%d] Success: %s...', i, result.response.text:sub(1, 50)))
+      else
+        print(string.format('[%d] Failed: %s', i, tostring(result.error)))
+      end
+    end
+
+    client:close()
+    print('\nDone!')
+  end):catch(function(err)
+    print('Error:', vim.inspect(err))
+  end)
+end
+
+---Example 19: Map files for parallel review
+local function example_map_files()
+  local headless = require('opencode.headless')
+  local Promise = require('opencode.promise')
+
+  Promise.spawn(function()
+    local client = headless.new():await()
+    print('Starting parallel file review...')
+
+    -- Files to review
+    local files = {
+      'lua/opencode/init.lua',
+      'lua/opencode/config.lua',
+      'lua/opencode/util.lua',
+    }
+
+    -- Map each file to a review request
+    local results = client:map(files, function(file)
+      return {
+        message = 'Briefly describe what this file does (1 sentence)',
+        context = {
+          mentioned_files = { file },
+        },
+      }
+    end, {
+      max_concurrent = 3,
+    }):await()
+
+    print('\n=== File Reviews ===')
+    for i, result in ipairs(results) do
+      print(string.format('\n[%s]', files[i]))
+      if result.success then
+        print(result.response.text:sub(1, 150))
+      else
+        print('Error:', tostring(result.error))
+      end
+    end
+
+    client:close()
+    print('\nDone!')
+  end):catch(function(err)
+    print('Error:', vim.inspect(err))
+  end)
+end
+
 -- Return examples for manual testing
 return {
   simple_chat = example_simple_chat,
@@ -634,4 +767,8 @@ return {
   with_images = example_with_images,
   with_multiple_images = example_with_multiple_images,
   image_streaming = example_image_streaming,
+  with_retry = example_with_retry,
+  with_timeout = example_with_timeout,
+  batch_requests = example_batch_requests,
+  map_files = example_map_files,
 }
