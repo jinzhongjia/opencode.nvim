@@ -19,4 +19,19 @@
 ---@field message OpencodeMessage Raw message object
 ---@field session_id string Session ID
 
+---@class ChatStreamOptions : ChatOptions
+---@field on_data fun(chunk: MessageChunk): nil Callback for incremental data
+---@field on_done fun(message: OpencodeMessage): nil Callback when done
+---@field on_error fun(error: any): nil Callback for errors
+
+---@class MessageChunk
+---@field type string Type of the chunk (e.g., 'text', 'tool', etc.)
+---@field text? string Text content (if type is 'text')
+---@field part OpencodeMessagePart Complete part data
+
+---@class StreamHandle
+---@field abort fun(): Promise<boolean> Abort the streaming response
+---@field is_done fun(): boolean Check if the stream is done
+---@field get_partial_text fun(): string Get accumulated partial text so far
+
 return {}

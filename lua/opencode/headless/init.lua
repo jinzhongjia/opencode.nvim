@@ -315,6 +315,140 @@ function OpencodeHeadless:abort(session_id)
   end
 end
 
+---Send a streaming chat message
+---@param message string The message to send
+---@param opts ChatStreamOptions Stream options with callbacks
+---@return StreamHandle
+function OpencodeHeadless:chat_stream(message, opts)
+  local StreamHandle = require('opencode.headless.stream_handler')
+  
+  opts = opts or {}
+  
+  -- Use existing session or create new one
+  local session_promise
+  if opts.session_id then
+    local session = self.active_sessions[opts.session_id]
+    if session then
+      session_promise = Promise.new():resolve(session)
+    else
+      -- Try to get from API
+      session_promise = self.api_client:get_session(opts.session_id):and_then(function(s)
+        self.active_sessions[opts.session_id] = s
+        return s
+      end)
+    end
+  elseif opts.new_session == false then
+    -- Try to use an existing active session
+    local session_id = next(self.active_sessions)
+    if session_id then
+      session_promise = Promise.new():resolve(self.active_sessions[session_id])
+    else
+      -- No existing session, create new one
+      session_promise = self:_create_new_session(opts.model or self.config.model, opts.agent or self.config.agent)
+    end
+  else
+    -- Create new session (default behavior)
+    session_promise = self:_create_new_session(opts.model or self.config.model, opts.agent or self.config.agent)
+  end
+  
+  -- Create stream handle first (to return immediately)
+  local stream_handle = nil
+  
+  -- Start the streaming process
+  session_promise
+    :and_then(function(session)
+      -- Create callbacks wrapper
+      local callbacks = {
+        on_data = opts.on_data or function() end,
+        on_done = opts.on_done or function() end,
+        on_error = opts.on_error or function() end,
+      }
+      
+      -- Create stream handle
+      stream_handle = StreamHandle.new(session.id, self.event_manager, self.api_client, callbacks)
+      
+      -- Build message parts
+      local parts = {}
+      if opts.context then
+        -- TODO: Use context.format_message from context.lua
+        table.insert(parts, {
+          type = 'text',
+          text = message,
+        })
+      else
+        table.insert(parts, {
+          type = 'text',
+          text = message,
+        })
+      end
+      
+      -- Build message data
+      local message_data = {
+        parts = parts,
+      }
+      
+      -- Add model if specified
+      local model = opts.model or self.config.model
+      if model then
+        local provider, model_id = model:match('^(.-)/(.+)$')
+        if provider and model_id then
+          message_data.model = {
+            providerID = provider,
+            modelID = model_id,
+          }
+        end
+      end
+      
+      -- Add agent if specified
+      local agent = opts.agent or self.config.agent
+      if agent then
+        message_data.agent = agent
+      end
+      
+      -- Send the message (this will trigger streaming events)
+      return self.api_client:create_message(session.id, message_data)
+    end)
+    :catch(function(err)
+      -- If stream handle exists, call error callback
+      if stream_handle and opts.on_error then
+        vim.schedule(function()
+          opts.on_error(err)
+        end)
+      end
+    end)
+  
+  -- Return a placeholder stream handle that will be replaced
+  -- We need to return something immediately, so we create a dummy handle
+  local dummy_handle = {
+    abort = function()
+      return Promise.new():resolve(false)
+    end,
+    is_done = function()
+      return true
+    end,
+    get_partial_text = function()
+      return ''
+    end,
+  }
+  
+  -- Replace with real handle once created
+  session_promise:and_then(function()
+    if stream_handle then
+      dummy_handle.abort = function()
+        return stream_handle:abort()
+      end
+      dummy_handle.is_done = function()
+        return stream_handle:is_done()
+      end
+      dummy_handle.get_partial_text = function()
+        return stream_handle:get_partial_text()
+      end
+    end
+  end)
+  
+  return dummy_handle
+end
+
 ---Close the headless client and cleanup resources
 function OpencodeHeadless:close()
   -- Stop event manager

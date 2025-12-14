@@ -146,4 +146,30 @@ describe('opencode.headless', function()
       end
     end)
   end)
+
+  describe('chat_stream', function()
+    it('returns a StreamHandle', function()
+      local instance
+      headless.new():and_then(function(inst)
+        instance = inst
+      end)
+
+      vim.wait(100, function()
+        return instance ~= nil
+      end)
+
+      if instance then
+        local handle = instance:chat_stream('test', {
+          on_data = function() end,
+          on_done = function() end,
+          on_error = function() end,
+        })
+
+        assert.is_not_nil(handle)
+        assert.is_function(handle.abort)
+        assert.is_function(handle.is_done)
+        assert.is_function(handle.get_partial_text)
+      end
+    end)
+  end)
 end)

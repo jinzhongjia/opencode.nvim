@@ -97,10 +97,47 @@ local function example_with_spawn()
   end)
 end
 
+---Example 5: Streaming response
+local function example_streaming()
+  local headless = require('opencode.headless')
+
+  headless.new():and_then(function(client)
+    print('Starting streaming chat...')
+
+    local partial_text = ''
+    local handle = client:chat_stream('Tell me a short story', {
+      on_data = function(chunk)
+        if chunk.text then
+          partial_text = partial_text .. chunk.text
+          -- Print each chunk as it arrives
+          io.write(chunk.text)
+          io.flush()
+        end
+      end,
+      on_done = function(message)
+        print('\n\n=== Streaming complete ===')
+        print('Total text length:', #partial_text)
+        print('Message parts:', #(message.parts or {}))
+        client:close()
+      end,
+      on_error = function(err)
+        print('\nError:', vim.inspect(err))
+        client:close()
+      end,
+    })
+
+    print('Stream handle created')
+    print('Is done?', handle.is_done())
+  end):catch(function(err)
+    print('Failed to create client:', vim.inspect(err))
+  end)
+end
+
 -- Return examples for manual testing
 return {
   simple_chat = example_simple_chat,
   multi_turn = example_multi_turn,
   with_options = example_with_options,
   with_spawn = example_with_spawn,
+  streaming = example_streaming,
 }
