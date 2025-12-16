@@ -2423,3 +2423,557 @@ describe('opencode.headless.context immutability', function()
     assert.equal('local x = 1', result.content)
   end)
 end)
+
+describe('opencode.headless session cache TTL', function()
+  local original_ensure_server
+  local original_api_client_create
+  local mock_api_client
+  local session_counter = 0
+
+  before_each(function()
+    session_counter = 0
+    local server_job = require('opencode.server_job')
+    local api_client_module = require('opencode.api_client')
+    original_ensure_server = server_job.ensure_server
+    original_api_client_create = api_client_module.create
+
+    server_job.ensure_server = function()
+      return Promise.new():resolve(true)
+    end
+
+    mock_api_client = {
+      create_session = function()
+        session_counter = session_counter + 1
+        return Promise.new():resolve({
+          id = 'session-' .. session_counter,
+          directory = '/test/dir',
+        })
+      end,
+      get_session = function(_, session_id)
+        return Promise.new():resolve({
+          id = session_id,
+          directory = '/test/dir',
+        })
+      end,
+      abort_session = function()
+        return Promise.new():resolve(true)
+      end,
+    }
+
+    api_client_module.create = function()
+      return mock_api_client
+    end
+  end)
+
+  after_each(function()
+    local server_job = require('opencode.server_job')
+    local api_client_module = require('opencode.api_client')
+    if original_ensure_server then
+      server_job.ensure_server = original_ensure_server
+    end
+    if original_api_client_create then
+      api_client_module.create = original_api_client_create
+    end
+  end)
+
+  it('caches session with timestamp', function()
+    local instance
+    headless.new():and_then(function(inst)
+      instance = inst
+      return inst:create_session()
+    end)
+
+    vim.wait(100, function()
+      return instance ~= nil and vim.tbl_count(instance.active_sessions) > 0
+    end)
+
+    assert.is_not_nil(instance)
+    if instance then
+      assert.equal(1, vim.tbl_count(instance.active_sessions))
+      assert.equal(1, vim.tbl_count(instance.session_timestamps))
+      assert.is_not_nil(instance.session_timestamps['session-1'])
+    end
+  end)
+
+  it('returns cached session when valid', function()
+    local instance, session1, session2
+    headless.new():and_then(function(inst)
+      instance = inst
+      return inst:create_session()
+    end):and_then(function(s)
+      session1 = s
+      return instance:get_session(s.id)
+    end):and_then(function(s)
+      session2 = s
+    end)
+
+    vim.wait(100, function()
+      return session2 ~= nil
+    end)
+
+    -- Should return same cached session, not create new one
+    assert.equal(1, session_counter)
+    assert.equal(session1.id, session2.id)
+  end)
+
+  it('respects session_cache_ttl configuration', function()
+    local instance
+    headless.new({
+      session_cache_ttl = 100, -- 100ms TTL
+    }):and_then(function(inst)
+      instance = inst
+    end)
+
+    vim.wait(50, function()
+      return instance ~= nil
+    end)
+
+    assert.is_not_nil(instance)
+    if instance then
+      assert.equal(100, instance.config.session_cache_ttl)
+    end
+  end)
+
+  it('invalidates expired cache', function()
+    local instance, session
+    headless.new({
+      session_cache_ttl = 50, -- 50ms TTL for testing
+    }):and_then(function(inst)
+      instance = inst
+      return inst:create_session()
+    end):and_then(function(s)
+      session = s
+    end)
+
+    vim.wait(100, function()
+      return session ~= nil
+    end)
+
+    assert.is_not_nil(instance)
+    if instance then
+      -- Session should be cached initially
+      assert.is_not_nil(instance:_get_cached_session(session.id))
+
+      -- Wait for TTL to expire
+      vim.wait(100, function() return false end)
+
+      -- Session should be expired now
+      local cached = instance:_get_cached_session(session.id)
+      assert.is_nil(cached)
+    end
+  end)
+
+  it('clears timestamps on close', function()
+    local instance
+    headless.new():and_then(function(inst)
+      instance = inst
+      return inst:create_session()
+    end):and_then(function()
+      instance:close()
+    end)
+
+    vim.wait(100, function()
+      return instance ~= nil and vim.tbl_count(instance.active_sessions) == 0
+    end)
+
+    assert.is_not_nil(instance)
+    if instance then
+      assert.equal(0, vim.tbl_count(instance.active_sessions))
+      assert.equal(0, vim.tbl_count(instance.session_timestamps))
+    end
+  end)
+end)
+
+describe('opencode.headless batch fail_fast', function()
+  local original_ensure_server
+  local original_api_client_create
+  local mock_api_client
+
+  before_each(function()
+    local server_job = require('opencode.server_job')
+    local api_client_module = require('opencode.api_client')
+    original_ensure_server = server_job.ensure_server
+    original_api_client_create = api_client_module.create
+
+    server_job.ensure_server = function()
+      return Promise.new():resolve(true)
+    end
+
+    mock_api_client = {
+      create_session = function()
+        return Promise.new():resolve({
+          id = 'batch-session',
+          directory = '/test/dir',
+        })
+      end,
+      abort_session = function()
+        return Promise.new():resolve(true)
+      end,
+    }
+
+    api_client_module.create = function()
+      return mock_api_client
+    end
+  end)
+
+  after_each(function()
+    local server_job = require('opencode.server_job')
+    local api_client_module = require('opencode.api_client')
+    if original_ensure_server then
+      server_job.ensure_server = original_ensure_server
+    end
+    if original_api_client_create then
+      api_client_module.create = original_api_client_create
+    end
+  end)
+
+  it('continues on error when fail_fast is false (default)', function()
+    local instance, results
+    local chat_count = 0
+
+    headless.new():and_then(function(inst)
+      instance = inst
+      -- Replace chat method with mock
+      inst.chat = function(_, msg, opts)
+        chat_count = chat_count + 1
+        local p = Promise.new()
+        -- Use vim.schedule to simulate async
+        vim.schedule(function()
+          if chat_count == 2 then
+            p:reject('simulated error')
+          else
+            p:resolve({
+              text = 'response ' .. chat_count,
+              session_id = 'test',
+            })
+          end
+        end)
+        return p
+      end
+    end)
+
+    vim.wait(100, function()
+      return instance ~= nil
+    end)
+
+    if instance then
+      instance:batch({
+        { message = 'msg1' },
+        { message = 'msg2' },
+        { message = 'msg3' },
+      }, {
+        fail_fast = false,
+        max_concurrent = 1,
+      }):and_then(function(r)
+        results = r
+      end)
+
+      vim.wait(500, function()
+        return results ~= nil
+      end)
+
+      assert.is_not_nil(results)
+      if results then
+        assert.equal(3, #results)
+        assert.is_true(results[1].success)
+        assert.is_false(results[2].success)
+        assert.equal('simulated error', results[2].error)
+        assert.is_true(results[3].success)
+      end
+    end
+  end)
+
+  it('stops on first error when fail_fast is true', function()
+    local instance, results, error_result
+    local chat_count = 0
+
+    headless.new():and_then(function(inst)
+      instance = inst
+      inst.chat = function(_, msg, opts)
+        chat_count = chat_count + 1
+        local p = Promise.new()
+        vim.schedule(function()
+          if chat_count == 2 then
+            p:reject('simulated error')
+          else
+            p:resolve({
+              text = 'response ' .. chat_count,
+              session_id = 'test',
+            })
+          end
+        end)
+        return p
+      end
+    end)
+
+    vim.wait(100, function()
+      return instance ~= nil
+    end)
+
+    if instance then
+      instance:batch({
+        { message = 'msg1' },
+        { message = 'msg2' },
+        { message = 'msg3' },
+      }, {
+        fail_fast = true,
+        max_concurrent = 1,
+      }):and_then(function(r)
+        results = r
+      end):catch(function(err)
+        error_result = err
+      end)
+
+      vim.wait(500, function()
+        return results ~= nil or error_result ~= nil
+      end)
+
+      -- Should reject with error info
+      assert.is_nil(results)
+      assert.is_not_nil(error_result)
+      if error_result then
+        assert.is_not_nil(error_result.error)
+        assert.is_not_nil(error_result.partial_results)
+        assert.is_not_nil(error_result.completed_count)
+      end
+    end
+  end)
+
+  it('includes partial_results in fail_fast error', function()
+    local instance, error_result
+    local chat_count = 0
+
+    headless.new():and_then(function(inst)
+      instance = inst
+      inst.chat = function(_, msg, opts)
+        chat_count = chat_count + 1
+        local p = Promise.new()
+        vim.schedule(function()
+          if chat_count == 2 then
+            p:reject('error at request 2')
+          else
+            p:resolve({
+              text = 'response ' .. chat_count,
+              session_id = 'test',
+            })
+          end
+        end)
+        return p
+      end
+    end)
+
+    vim.wait(100, function()
+      return instance ~= nil
+    end)
+
+    if instance then
+      instance:batch({
+        { message = 'msg1' },
+        { message = 'msg2' },
+        { message = 'msg3' },
+      }, {
+        fail_fast = true,
+        max_concurrent = 1,
+      }):catch(function(err)
+        error_result = err
+      end)
+
+      vim.wait(500, function()
+        return error_result ~= nil
+      end)
+
+      assert.is_not_nil(error_result)
+      if error_result and error_result.partial_results then
+        -- First request should have succeeded
+        assert.is_true(error_result.partial_results[1].success)
+        -- Second request should have failed
+        assert.is_false(error_result.partial_results[2].success)
+        assert.equal('error at request 2', error_result.partial_results[2].error)
+      end
+    end
+  end)
+end)
+
+describe('opencode.headless.stream_handler pending_parts', function()
+  local EventManager = require('opencode.event_manager')
+  local StreamHandle = require('opencode.headless.stream_handler')
+
+  it('queues parts received before message_id is known', function()
+    local event_manager = EventManager.new()
+    event_manager:start()
+
+    local mock_api_client = {}
+    local received_chunks = {}
+    local callbacks = {
+      on_data = function(chunk)
+        table.insert(received_chunks, chunk)
+      end,
+      on_done = function() end,
+      on_error = function() end,
+    }
+
+    local handle = StreamHandle.new('test-session', event_manager, mock_api_client, callbacks)
+
+    -- Send part WITHOUT messageID first (should be queued)
+    event_manager:emit('message.part.updated', {
+      part = {
+        id = 'part-1',
+        sessionID = 'test-session',
+        type = 'text',
+        text = 'queued text',
+      },
+    })
+
+    -- Part should be processed immediately for backward compatibility
+    vim.wait(100, function()
+      return #received_chunks > 0
+    end)
+
+    assert.equal(1, #received_chunks)
+    assert.equal('queued text', received_chunks[1].text)
+
+    event_manager:stop()
+  end)
+
+  it('processes pending parts when message_id is set from message.updated', function()
+    local event_manager = EventManager.new()
+    event_manager:start()
+
+    local mock_api_client = {}
+    local received_chunks = {}
+    local callbacks = {
+      on_data = function(chunk)
+        table.insert(received_chunks, chunk)
+      end,
+      on_done = function() end,
+      on_error = function() end,
+    }
+
+    local handle = StreamHandle.new('test-session', event_manager, mock_api_client, callbacks)
+
+    -- First, send message.updated to set message_id
+    event_manager:emit('message.updated', {
+      info = {
+        id = 'msg-123',
+        sessionID = 'test-session',
+        role = 'assistant',
+      },
+    })
+
+    -- Then send part with matching messageID
+    event_manager:emit('message.part.updated', {
+      part = {
+        id = 'part-1',
+        sessionID = 'test-session',
+        messageID = 'msg-123',
+        type = 'text',
+        text = 'after message_id',
+      },
+    })
+
+    vim.wait(100, function()
+      return #received_chunks > 0
+    end)
+
+    assert.equal(1, #received_chunks)
+    assert.equal('after message_id', received_chunks[1].text)
+
+    event_manager:stop()
+  end)
+
+  it('infers message_id from first part with messageID', function()
+    local event_manager = EventManager.new()
+    event_manager:start()
+
+    local mock_api_client = {}
+    local received_chunks = {}
+    local callbacks = {
+      on_data = function(chunk)
+        table.insert(received_chunks, chunk)
+      end,
+      on_done = function() end,
+      on_error = function() end,
+    }
+
+    local handle = StreamHandle.new('test-session', event_manager, mock_api_client, callbacks)
+
+    -- Send part WITH messageID (should infer message_id)
+    event_manager:emit('message.part.updated', {
+      part = {
+        id = 'part-1',
+        sessionID = 'test-session',
+        messageID = 'inferred-msg-id',
+        type = 'text',
+        text = 'first part',
+      },
+    })
+
+    vim.wait(100, function()
+      return #received_chunks > 0
+    end)
+
+    -- message_id should be inferred
+    assert.equal('inferred-msg-id', handle.message_id)
+    assert.equal(1, #received_chunks)
+
+    event_manager:stop()
+  end)
+
+  it('filters parts with different messageID after message_id is set', function()
+    local event_manager = EventManager.new()
+    event_manager:start()
+
+    local mock_api_client = {}
+    local received_chunks = {}
+    local callbacks = {
+      on_data = function(chunk)
+        table.insert(received_chunks, chunk)
+      end,
+      on_done = function() end,
+      on_error = function() end,
+    }
+
+    local handle = StreamHandle.new('test-session', event_manager, mock_api_client, callbacks)
+
+    -- Set message_id via message.updated
+    event_manager:emit('message.updated', {
+      info = {
+        id = 'correct-msg-id',
+        sessionID = 'test-session',
+        role = 'assistant',
+      },
+    })
+
+    -- Send part with wrong messageID (should be filtered)
+    event_manager:emit('message.part.updated', {
+      part = {
+        id = 'part-wrong',
+        sessionID = 'test-session',
+        messageID = 'wrong-msg-id',
+        type = 'text',
+        text = 'wrong message',
+      },
+    })
+
+    -- Send part with correct messageID
+    event_manager:emit('message.part.updated', {
+      part = {
+        id = 'part-correct',
+        sessionID = 'test-session',
+        messageID = 'correct-msg-id',
+        type = 'text',
+        text = 'correct message',
+      },
+    })
+
+    vim.wait(100, function()
+      return #received_chunks > 0
+    end)
+
+    -- Should only receive the correct message
+    assert.equal(1, #received_chunks)
+    assert.equal('correct message', received_chunks[1].text)
+
+    event_manager:stop()
+  end)
+end)

@@ -103,6 +103,7 @@ Creates a new headless client instance.
   - `timeout` (number): Timeout in milliseconds (default: `120000`)
   - `retry` (RetryConfig): Retry configuration (see below)
   - `permission_handler` (PermissionHandlerConfig): Default permission handling configuration
+  - `session_cache_ttl` (number): Session cache TTL in milliseconds (default: `300000`, 5 minutes)
 
 **Returns:** `Promise<OpencodeHeadless>`
 
@@ -556,6 +557,7 @@ local results = client:batch({
   { message = 'Review file3.lua', context = { mentioned_files = {'file3.lua'} } },
 }, {
   max_concurrent = 3,  -- Maximum concurrency (default: 5)
+  fail_fast = false,   -- Stop on first error (default: false)
 }):await()
 
 for i, result in ipairs(results) do
@@ -565,6 +567,19 @@ for i, result in ipairs(results) do
     print('Request', i, 'failed:', result.error)
   end
 end
+```
+
+**With `fail_fast = true`:**
+
+```lua
+client:batch(requests, { fail_fast = true })
+  :and_then(function(results)
+    print('All succeeded!')
+  end)
+  :catch(function(err)
+    -- err contains: { error, partial_results, completed_count }
+    print('Failed at request', err.completed_count, ':', err.error)
+  end)
 ```
 
 ### `client:map(items, fn, opts?)`

@@ -22,12 +22,14 @@ local permission_handler_module = require('opencode.headless.permission_handler'
 ---@field timeout? number Timeout in milliseconds (default: 120000)
 ---@field retry? RetryConfig|boolean Retry configuration (true for defaults, false to disable)
 ---@field permission_handler? PermissionHandlerConfig Permission handling configuration
+---@field session_cache_ttl? number Session cache TTL in milliseconds (default: 300000, 5 minutes)
 
 ---@class OpencodeHeadless
 ---@field private config OpencodeHeadlessConfig
 ---@field private api_client OpencodeApiClient
 ---@field private event_manager EventManager
 ---@field private active_sessions table<string, Session>
+---@field private session_timestamps table<string, number> Cache timestamps for sessions
 ---@field private server OpencodeServer|nil
 ---@field private retry_config RetryConfig|nil
 ---@field private permission_handler PermissionHandler|nil
@@ -48,6 +50,7 @@ function OpencodeHeadless.new(opts)
     directory = opts.directory or vim.fn.getcwd(),
     timeout = opts.timeout or 120000, -- 2 minutes default
     retry = opts.retry,
+    session_cache_ttl = opts.session_cache_ttl or 300000, -- 5 minutes default
   }
 
   -- Normalize retry config
@@ -88,6 +91,7 @@ function OpencodeHeadless.new(opts)
         api_client = api_client,
         event_manager = event_manager,
         active_sessions = {}, -- Track sessions we're using
+        session_timestamps = {}, -- Track when sessions were cached
         server = server,
         retry_config = retry_config,
         permission_handler = permission_handler,
@@ -102,6 +106,49 @@ function OpencodeHeadless.new(opts)
   return promise
 end
 
+---Internal: Cache a session with timestamp
+---@param session Session
+---@private
+function OpencodeHeadless:_cache_session(session)
+  self.active_sessions[session.id] = session
+  self.session_timestamps[session.id] = vim.loop.now()
+end
+
+---Internal: Check if a cached session is still valid (not expired)
+---@param session_id string
+---@return boolean
+---@private
+function OpencodeHeadless:_is_session_cache_valid(session_id)
+  local timestamp = self.session_timestamps[session_id]
+  if not timestamp then
+    return false
+  end
+  local age = vim.loop.now() - timestamp
+  return age < self.config.session_cache_ttl
+end
+
+---Internal: Get a cached session if valid, otherwise nil
+---@param session_id string
+---@return Session|nil
+---@private
+function OpencodeHeadless:_get_cached_session(session_id)
+  if self:_is_session_cache_valid(session_id) then
+    return self.active_sessions[session_id]
+  end
+  -- Cache expired, remove it
+  self.active_sessions[session_id] = nil
+  self.session_timestamps[session_id] = nil
+  return nil
+end
+
+---Internal: Invalidate a cached session
+---@param session_id string
+---@private
+function OpencodeHeadless:_invalidate_session_cache(session_id)
+  self.active_sessions[session_id] = nil
+  self.session_timestamps[session_id] = nil
+end
+
 ---Internal: Create a new session
 ---@param model? string
 ---@param agent? string
@@ -112,7 +159,7 @@ function OpencodeHeadless:_create_new_session(model, agent)
   _ = model -- silence unused warning
   _ = agent -- silence unused warning
   return self.api_client:create_session():and_then(function(session)
-    self.active_sessions[session.id] = session
+    self:_cache_session(session)
     return session
   end)
 end
@@ -127,23 +174,29 @@ function OpencodeHeadless:chat(message, opts)
   -- Use existing session or create new one
   local session_promise
   if opts.session_id then
-    local session = self.active_sessions[opts.session_id]
+    local session = self:_get_cached_session(opts.session_id)
     if session then
       session_promise = Promise.new():resolve(session)
     else
-      -- Try to get from API
+      -- Try to get from API (cache expired or not found)
       session_promise = self.api_client:get_session(opts.session_id):and_then(function(s)
-        self.active_sessions[opts.session_id] = s
+        self:_cache_session(s)
         return s
       end)
     end
   elseif opts.new_session == false then
-    -- Try to use an existing active session
-    local session_id = next(self.active_sessions)
-    if session_id then
-      session_promise = Promise.new():resolve(self.active_sessions[session_id])
+    -- Try to use an existing active session (that hasn't expired)
+    local valid_session = nil
+    for session_id, _ in pairs(self.active_sessions) do
+      if self:_is_session_cache_valid(session_id) then
+        valid_session = self.active_sessions[session_id]
+        break
+      end
+    end
+    if valid_session then
+      session_promise = Promise.new():resolve(valid_session)
     else
-      -- No existing session, create new one
+      -- No valid session, create new one
       session_promise = self:_create_new_session(opts.model or self.config.model, opts.agent or self.config.agent)
     end
   else
@@ -164,11 +217,14 @@ end
 function OpencodeHeadless:send_message(session_id, message, opts)
   opts = opts or {}
 
-  -- Get the session (from cache or API)
-  local session = self.active_sessions[session_id]
+  -- Get the session (from cache, must be valid)
+  local session = self:_get_cached_session(session_id)
   if not session then
-    return Promise.new():reject('Session not found: ' .. session_id)
+    return Promise.new():reject('Session not found or cache expired: ' .. session_id)
   end
+
+  -- Refresh cache timestamp on use
+  self.session_timestamps[session_id] = vim.loop.now()
 
   -- Build message parts using context if provided
   local parts
@@ -328,7 +384,7 @@ end
 function OpencodeHeadless:create_session(opts)
   opts = opts or {}
   return self.api_client:create_session({ title = opts.title }):and_then(function(session)
-    self.active_sessions[session.id] = session
+    self:_cache_session(session)
     return session
   end)
 end
@@ -337,8 +393,8 @@ end
 ---@param session_id string
 ---@return Promise<Session|nil>
 function OpencodeHeadless:get_session(session_id)
-  -- Check cache first
-  local session = self.active_sessions[session_id]
+  -- Check cache first (with TTL check)
+  local session = self:_get_cached_session(session_id)
   if session then
     return Promise.new():resolve(session)
   end
@@ -346,7 +402,7 @@ function OpencodeHeadless:get_session(session_id)
   -- Fetch from API using existing session utilities
   return session_utils.get_by_id(session_id):and_then(function(s)
     if s then
-      self.active_sessions[session_id] = s
+      self:_cache_session(s)
     end
     return s
   end)
@@ -420,68 +476,90 @@ function OpencodeHeadless:chat_stream(message, opts)
 
   -- Create a proxy handle that forwards to the real handle once ready
   -- This allows returning immediately while the session is being created
-  local real_handle = nil
-  local pending_abort = false
-  local is_ready = false
-
-  local proxy_handle = {
-    ---@return Promise<boolean>
-    abort = function()
-      if real_handle then
-        return real_handle:abort()
-      end
-      -- Mark for abort when handle becomes ready
-      pending_abort = true
-      return Promise.new():resolve(true)
-    end,
-    ---@return boolean
-    is_done = function()
-      if real_handle then
-        return real_handle:is_done()
-      end
-      return pending_abort
-    end,
-    ---@return string
-    get_partial_text = function()
-      if real_handle then
-        return real_handle:get_partial_text()
-      end
-      return ''
-    end,
-    ---@return table<string, ToolCallInfo>
-    get_tool_calls = function()
-      if real_handle then
-        return real_handle:get_tool_calls()
-      end
-      return {}
-    end,
-    ---Check if the handle is ready (session created, streaming started)
-    ---@return boolean
-    is_ready = function()
-      return is_ready
-    end,
+  local proxy_state = {
+    real_handle = nil,
+    pending_abort = false,
+    is_ready = false,
   }
+
+  -- Default values when real_handle is not ready
+  local proxy_defaults = {
+    get_partial_text = '',
+    get_tool_calls = {},
+  }
+
+  local proxy_handle = setmetatable({}, {
+    __index = function(_, key)
+      -- Special cases that need custom logic
+      if key == 'abort' then
+        return function()
+          if proxy_state.real_handle then
+            return proxy_state.real_handle:abort()
+          end
+          proxy_state.pending_abort = true
+          return Promise.new():resolve(true)
+        end
+      elseif key == 'is_done' then
+        return function()
+          if proxy_state.real_handle then
+            return proxy_state.real_handle:is_done()
+          end
+          return proxy_state.pending_abort
+        end
+      elseif key == 'is_ready' then
+        return function()
+          return proxy_state.is_ready
+        end
+      end
+
+      -- Delegate to real_handle if ready, otherwise return default
+      if proxy_state.real_handle then
+        local method = proxy_state.real_handle[key]
+        if type(method) == 'function' then
+          return function(...)
+            return method(proxy_state.real_handle, ...)
+          end
+        end
+        return method
+      end
+
+      -- Return default value for known methods
+      if proxy_defaults[key] ~= nil then
+        return function()
+          return proxy_defaults[key]
+        end
+      end
+
+      return nil
+    end,
+  })
 
   -- Use existing session or create new one
   local session_promise
   if opts.session_id then
-    local session = self.active_sessions[opts.session_id]
+    local session = self:_get_cached_session(opts.session_id)
     if session then
       session_promise = Promise.new():resolve(session)
     else
-      -- Try to get from API
+      -- Try to get from API (cache expired or not found)
       session_promise = self.api_client:get_session(opts.session_id):and_then(function(s)
-        self.active_sessions[opts.session_id] = s
+        self:_cache_session(s)
         return s
       end)
     end
   elseif opts.new_session == false then
-    -- Try to use an existing active session
-    local session_id = next(self.active_sessions)
-    if session_id then
-      session_promise = Promise.new():resolve(self.active_sessions[session_id])
+    -- Try to use an existing active session (that hasn't expired)
+    local valid_session = nil
+    for session_id, _ in pairs(self.active_sessions) do
+      if self:_is_session_cache_valid(session_id) then
+        valid_session = self.active_sessions[session_id]
+        break
+      end
+    end
+    if valid_session then
+      session_promise = Promise.new():resolve(valid_session)
     else
-      -- No existing session, create new one
+      -- No valid session, create new one
       session_promise = self:_create_new_session(opts.model or self.config.model, opts.agent or self.config.agent)
     end
   else
@@ -493,7 +571,7 @@ function OpencodeHeadless:chat_stream(message, opts)
   session_promise
     :and_then(function(session)
       -- Check if abort was requested before we got the session
-      if pending_abort then
+      if proxy_state.pending_abort then
         if opts.on_done then
           vim.schedule(function()
             opts.on_done({ parts = {}, info = { role = 'assistant' } })
@@ -521,14 +599,14 @@ function OpencodeHeadless:chat_stream(message, opts)
       end
 
       -- Create stream handle with all callbacks and permission handler
-      real_handle = StreamHandle.new(
+      proxy_state.real_handle = StreamHandle.new(
         session.id,
         self.event_manager,
         self.api_client,
         callbacks,
         permission_handler
       )
-      is_ready = true
+      proxy_state.is_ready = true
 
       -- Build message parts using context if provided
       local parts
@@ -584,8 +662,9 @@ function OpencodeHeadless:close()
     self.event_manager:stop()
   end
 
-  -- Clear active sessions cache
+  -- Clear active sessions cache and timestamps
   self.active_sessions = {}
+  self.session_timestamps = {}
 
   -- Note: We don't shutdown the server here as it might be used by other clients
   -- If you want to shutdown the server, call server:shutdown() explicitly
@@ -604,13 +683,18 @@ end
 ---@field error? any The error (if failed)
 ---@field index number Original index in the batch
 
+---@class BatchOptions
+---@field max_concurrent? number Maximum concurrent requests (default: 5)
+---@field fail_fast? boolean Stop on first error (default: false)
+
 ---Execute multiple chat requests in parallel
 ---@param requests BatchRequest[] Array of chat requests
----@param opts? { max_concurrent?: number } Batch options
+---@param opts? BatchOptions Batch options
 ---@return Promise<BatchResult[]>
 function OpencodeHeadless:batch(requests, opts)
   opts = opts or {}
   local max_concurrent = opts.max_concurrent or 5
+  local fail_fast = opts.fail_fast or false
 
   -- Create promises for all requests
   local results = {}
@@ -618,8 +702,19 @@ function OpencodeHeadless:batch(requests, opts)
     results[i] = { success = false, index = i }
   end
 
+  -- Track if we should abort due to fail_fast
+  local should_abort = false
+  local first_error = nil
+
   -- Process in batches
   local function process_batch(start_idx)
+    -- Check if we should abort
+    if should_abort then
+      local promise = Promise.new()
+      promise:reject(first_error)
+      return promise
+    end
+
     local batch_promises = {}
     local end_idx = math.min(start_idx + max_concurrent - 1, #requests)
 
@@ -639,20 +734,58 @@ function OpencodeHeadless:batch(requests, opts)
         end)
         :catch(function(err)
           results[idx] = { success = false, error = err, index = idx }
+          -- If fail_fast, mark for abort
+          if fail_fast and not should_abort then
+            should_abort = true
+            first_error = err
+          end
           return results[idx]
         end)
 
       table.insert(batch_promises, request_promise)
     end
 
-    -- Wait for this batch to complete
-    return Promise.all(batch_promises):and_then(function()
-      -- Process next batch if there are more requests
-      if end_idx < #requests then
-        return process_batch(end_idx + 1)
+    -- Wait for all promises in this batch to complete
+    local batch_result_promise = Promise.new()
+    local completed_count = 0
+    local batch_size = #batch_promises
+
+    local function check_batch_complete()
+      completed_count = completed_count + 1
+      if completed_count >= batch_size then
+        -- Check if we should abort after this batch
+        if should_abort then
+          batch_result_promise:reject({
+            error = first_error,
+            partial_results = results,
+            completed_count = end_idx,
+          })
+        else
+          -- Process next batch if there are more requests
+          if end_idx < #requests then
+            process_batch(end_idx + 1)
+              :and_then(function(r)
+                batch_result_promise:resolve(r)
+              end)
+              :catch(function(err)
+                batch_result_promise:reject(err)
+              end)
+          else
+            batch_result_promise:resolve(results)
+          end
+        end
       end
-      return results
-    end)
+    end
+
+    for _, p in ipairs(batch_promises) do
+      p:and_then(function()
+        check_batch_complete()
+      end):catch(function()
+        check_batch_complete()
+      end)
+    end
+
+    return batch_result_promise
   end
 
   if #requests == 0 then
@@ -666,7 +799,7 @@ end
 ---@generic T
 ---@param items T[] Array of items to process
 ---@param fn fun(item: T, index: number): BatchRequest Function to create request from item
----@param opts? { max_concurrent?: number } Batch options
+---@param opts? BatchOptions Batch options
 ---@return Promise<BatchResult[]>
 function OpencodeHeadless:map(items, fn, opts)
   local requests = {}

@@ -65,11 +65,83 @@ function StreamHandle.new(session_id, event_manager, api_client, callbacks, perm
     pending_permissions = {},
     text_parts = {},
     text_parts_order = {},
+    pending_parts = {}, -- Queue for parts received before message_id is known
   }, StreamHandle)
 
   self:_setup_listeners()
 
   return self
+end
+
+---Internal: Process a single part update
+---@param part OpencodeMessagePart
+---@private
+function StreamHandle:_process_part(part)
+  -- Handle text parts
+  if part.type == 'text' and part.text then
+    -- Track text by part ID to handle updates correctly
+    -- Events send complete part content, not incremental deltas
+    local part_id = part.id or 'default_text'
+    local prev_text = self.text_parts[part_id] or ''
+    local is_new_part = (prev_text == '')
+
+    self.text_parts[part_id] = part.text
+
+    -- Track order of parts (only add if new)
+    if is_new_part then
+      table.insert(self.text_parts_order, part_id)
+    end
+
+    -- Calculate the delta (new text that was added)
+    local delta_text = ''
+    if #part.text > #prev_text then
+      delta_text = part.text:sub(#prev_text + 1)
+    elseif part.text ~= prev_text then
+      -- Text was replaced entirely, use the full new text
+      delta_text = part.text
+    end
+
+    -- Update partial_text by reconstructing from all text parts (in order)
+    self.partial_text = ''
+    for _, pid in ipairs(self.text_parts_order) do
+      self.partial_text = self.partial_text .. (self.text_parts[pid] or '')
+    end
+
+    -- Call user callback for text data (with delta)
+    if self.callbacks.on_data and delta_text ~= '' then
+      vim.schedule(function()
+        self.callbacks.on_data({
+          type = part.type,
+          text = delta_text,
+          part = part,
+        })
+      end)
+    end
+  end
+
+  -- Handle tool call parts
+  if part.type == 'tool' and part.tool then
+    self:_handle_tool_call(part)
+  end
+end
+
+---Internal: Process all pending parts that match our message_id
+---@private
+function StreamHandle:_process_pending_parts()
+  if not self.message_id then
+    return
+  end
+
+  local remaining = {}
+  for _, part in ipairs(self.pending_parts) do
+    if part.messageID == self.message_id then
+      self:_process_part(part)
+    else
+      -- Keep parts that don't match (shouldn't happen, but be safe)
+      table.insert(remaining, part)
+    end
+  end
+  self.pending_parts = remaining
 end
 
 ---Internal: Setup event listeners
@@ -84,6 +156,8 @@ function StreamHandle:_setup_listeners()
     if data.info and data.info.sessionID == self.session_id and data.info.role == 'assistant' then
       if not self.message_id then
         self.message_id = data.info.id
+        -- Process any parts that were queued while waiting for message_id
+        self:_process_pending_parts()
       end
     end
   end
@@ -100,60 +174,28 @@ function StreamHandle:_setup_listeners()
       return
     end
 
-    -- Filter by session (sessionID and messageID are part properties)
+    -- Filter by session
     if part.sessionID ~= self.session_id then
       return
     end
-    if self.message_id and part.messageID ~= self.message_id then
+
+    -- If we don't know our message_id yet, try to infer it from the part
+    if not self.message_id then
+      if part.messageID then
+        -- Use the first part's messageID as our message_id
+        self.message_id = part.messageID
+        -- Process any pending parts now that we know the message_id
+        self:_process_pending_parts()
+      end
+      -- Even if messageID is nil, process the part (for backward compatibility)
+      -- This handles cases where parts don't have messageID set
+    elseif part.messageID and part.messageID ~= self.message_id then
+      -- If we have a message_id and part has a different one, skip it
       return
     end
 
-    -- Handle text parts
-    if part.type == 'text' and part.text then
-      -- Track text by part ID to handle updates correctly
-      -- Events send complete part content, not incremental deltas
-      local part_id = part.id or 'default_text'
-      local prev_text = self.text_parts[part_id] or ''
-      local is_new_part = (prev_text == '')
-
-      self.text_parts[part_id] = part.text
-
-      -- Track order of parts (only add if new)
-      if is_new_part then
-        table.insert(self.text_parts_order, part_id)
-      end
-
-      -- Calculate the delta (new text that was added)
-      local delta_text = ''
-      if #part.text > #prev_text then
-        delta_text = part.text:sub(#prev_text + 1)
-      elseif part.text ~= prev_text then
-        -- Text was replaced entirely, use the full new text
-        delta_text = part.text
-      end
-
-      -- Update partial_text by reconstructing from all text parts (in order)
-      self.partial_text = ''
-      for _, pid in ipairs(self.text_parts_order) do
-        self.partial_text = self.partial_text .. (self.text_parts[pid] or '')
-      end
-
-      -- Call user callback for text data (with delta)
-      if self.callbacks.on_data and delta_text ~= '' then
-        vim.schedule(function()
-          self.callbacks.on_data({
-            type = part.type,
-            text = delta_text,
-            part = part,
-          })
-        end)
-      end
-    end
-
-    -- Handle tool call parts
-    if part.type == 'tool' and part.tool then
-      self:_handle_tool_call(part)
-    end
+    -- Process the part
+    self:_process_part(part)
   end
 
   -- Listen for permission requests
